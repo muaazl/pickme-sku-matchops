@@ -31,7 +31,7 @@ import {
 import { Search, Database, Tag, Key, Layers, Award, Map, RefreshCw, SlidersHorizontal } from 'lucide-react';
 import { PageContainer, PageHeader, ConfirmDialog } from '../components/ui';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { searchCatalog, buildCatalogCache, checkCatalogSync } from '../api';
+import { searchCatalog, buildCatalogCache, checkCatalogSync, getCatalogSummaryStats } from '../api';
 import { useSnackbar } from 'notistack';
 import { useDebounce } from '../hooks/useDebounce';
 import {
@@ -90,34 +90,9 @@ export default function CatalogSearch() {
   const [diffData, setDiffData] = useState(null);
   const [diffDialogOpen, setDiffDialogOpen] = useState(false);
 
-  const { data: catalogStats } = useQuery({
-    queryKey: ['catalog-stats-catalog', domain],
-    queryFn: () => searchCatalog({ dataset: 'catalog', domain, page: 1, page_size: 1 }),
-    staleTime: 5 * 60 * 1000,
-  });
-  const { data: gkStats } = useQuery({
-    queryKey: ['catalog-stats-gk', domain],
-    queryFn: () => searchCatalog({ dataset: 'gk', domain, page: 1, page_size: 1 }),
-    staleTime: 5 * 60 * 1000,
-  });
-  const { data: btStats } = useQuery({
-    queryKey: ['catalog-stats-bt', domain],
-    queryFn: () => searchCatalog({ dataset: 'bt', domain, page: 1, page_size: 1 }),
-    staleTime: 5 * 60 * 1000,
-  });
-  const { data: categoryStats } = useQuery({
-    queryKey: ['catalog-stats-category', domain],
-    queryFn: () => searchCatalog({ dataset: 'category', domain, page: 1, page_size: 1 }),
-    staleTime: 5 * 60 * 1000,
-  });
-  const { data: brandsStats } = useQuery({
-    queryKey: ['catalog-stats-brands', domain],
-    queryFn: () => searchCatalog({ dataset: 'brands', domain, page: 1, page_size: 1 }),
-    staleTime: 5 * 60 * 1000,
-  });
-  const { data: mapStats } = useQuery({
-    queryKey: ['catalog-stats-map', domain],
-    queryFn: () => searchCatalog({ dataset: 'bt_gk_map', domain, page: 1, page_size: 1 }),
+  const { data: summaryStats } = useQuery({
+    queryKey: ['catalog-summary-stats', domain],
+    queryFn: () => getCatalogSummaryStats({ domain }),
     staleTime: 5 * 60 * 1000,
   });
 
@@ -206,12 +181,7 @@ export default function CatalogSearch() {
       // Invalidate queries so stats reload
       setTimeout(() => {
         queryClient.invalidateQueries({ queryKey: ['catalog'] });
-        queryClient.invalidateQueries({ queryKey: ['catalog-stats-catalog'] });
-        queryClient.invalidateQueries({ queryKey: ['catalog-stats-gk'] });
-        queryClient.invalidateQueries({ queryKey: ['catalog-stats-bt'] });
-        queryClient.invalidateQueries({ queryKey: ['catalog-stats-category'] });
-        queryClient.invalidateQueries({ queryKey: ['catalog-stats-brands'] });
-        queryClient.invalidateQueries({ queryKey: ['catalog-stats-map'] });
+        queryClient.invalidateQueries({ queryKey: ['catalog-summary-stats'] });
       }, 5000);
     } catch (err) {
       enqueueSnackbar(`Sync failed: ${err.message || err}`, { variant: 'error' });
@@ -454,7 +424,7 @@ export default function CatalogSearch() {
               Catalog SKUs
             </Typography>
             <Typography variant="h4" sx={{ mt: 1, fontWeight: 700 }}>
-              {catalogStats?.total != null ? catalogStats.total.toLocaleString() : '---'}
+              {summaryStats?.catalog != null ? summaryStats.catalog.toLocaleString() : '---'}
             </Typography>
           </CardContent>
         </Card>
@@ -475,7 +445,7 @@ export default function CatalogSearch() {
               Generic Keywords
             </Typography>
             <Typography variant="h4" sx={{ mt: 1, fontWeight: 700 }}>
-              {gkStats?.total != null ? gkStats.total.toLocaleString() : '---'}
+              {summaryStats?.gk != null ? summaryStats.gk.toLocaleString() : '---'}
             </Typography>
           </CardContent>
         </Card>
@@ -496,7 +466,7 @@ export default function CatalogSearch() {
               Basic Type
             </Typography>
             <Typography variant="h4" sx={{ mt: 1, fontWeight: 700 }}>
-              {btStats?.total != null ? btStats.total.toLocaleString() : '---'}
+              {summaryStats?.bt != null ? summaryStats.bt.toLocaleString() : '---'}
             </Typography>
           </CardContent>
         </Card>
@@ -517,7 +487,7 @@ export default function CatalogSearch() {
               {domain === 'food' ? 'Region' : 'Categories'}
             </Typography>
             <Typography variant="h4" sx={{ mt: 1, fontWeight: 700 }}>
-              {categoryStats?.total != null ? categoryStats.total.toLocaleString() : '---'}
+              {summaryStats?.category != null ? summaryStats.category.toLocaleString() : '---'}
             </Typography>
           </CardContent>
         </Card>
@@ -538,7 +508,7 @@ export default function CatalogSearch() {
               {domain === 'food' ? 'Flavors List' : 'Brands List'}
             </Typography>
             <Typography variant="h4" sx={{ mt: 1, fontWeight: 700 }}>
-              {brandsStats?.total != null ? brandsStats.total.toLocaleString() : '---'}
+              {summaryStats?.brands != null ? summaryStats.brands.toLocaleString() : '---'}
             </Typography>
           </CardContent>
         </Card>
@@ -559,7 +529,7 @@ export default function CatalogSearch() {
               Basic Type - Generic Keywords Map
             </Typography>
             <Typography variant="h4" sx={{ mt: 1, fontWeight: 700 }}>
-              {mapStats?.total != null ? mapStats.total.toLocaleString() : '---'}
+              {summaryStats?.bt_gk_map != null ? summaryStats.bt_gk_map.toLocaleString() : '---'}
             </Typography>
           </CardContent>
         </Card>

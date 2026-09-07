@@ -212,10 +212,19 @@ def run_sync(
                 logger.info(f"[{domain.upper()}] Step 1: Populating SQLite database from staged data...")
                 try:
                     reset_sqlite_tables(domain)
-                    DataIngestion.load_catalog(sheet_id, domain=domain, force_fetch=True)
+                    cat_df, _ = DataIngestion.load_catalog(sheet_id, domain=domain, force_fetch=True)
                     DataIngestion.load_classifier_dictionaries(sheet_id, domain=domain, force_fetch=True)
                     DataIngestion.load_bt_gk_map_from_sheets(sheet_id, domain=domain, force_fetch=True)
-                    logger.info(f"[{domain.upper()}] ✓ SQLite database successfully populated from staged data.")
+                    DataIngestion.compute_and_store_dictionary_counts(domain, cat_df=cat_df)
+                    logger.info(f"[{domain.upper()}] ✓ SQLite database successfully populated with dictionary occurrence counts.")
+                    
+                    # Sync dictionaries to Meilisearch
+                    try:
+                        from engine.data_pipeline.meilisearch_sync import sync_dictionaries_to_meili
+                        sync_dictionaries_to_meili(domain)
+                        logger.info(f"[{domain.upper()}] ✓ Meilisearch dictionary indexes successfully updated.")
+                    except Exception as meili_err:
+                        logger.warning(f"[{domain.upper()}] Could not sync dictionaries to Meilisearch: {meili_err}")
                 except Exception as e:
                     logger.error(f"[{domain.upper()}] Failed to sync SQLite database: {e}", exc_info=True)
                     sys.exit(1)

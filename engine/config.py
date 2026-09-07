@@ -60,6 +60,8 @@ QDRANT_COLLECTION_MARKET = "market_catalog"
 QDRANT_COLLECTION_FOOD = "food_catalog"
 MEILI_INDEX_MARKET = "market_catalog"
 MEILI_INDEX_FOOD = "food_catalog"
+MEILI_INDEX_MARKET_DICTS = "market_dictionaries"
+MEILI_INDEX_FOOD_DICTS = "food_dictionaries"
 
 
 # Hash salt for cache validation

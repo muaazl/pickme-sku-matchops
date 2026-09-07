@@ -2,7 +2,7 @@ import logging
 import os
 import sys
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import pandas as pd
 import polars as pl
@@ -11,6 +11,8 @@ import hashlib
 import json
 import io
 import shutil
+import sqlite3
+import threading
 
 from engine import config
 from engine.db import ensure_db_initialized
@@ -22,6 +24,7 @@ class DataIngestion:
 
     _catalog_mem_cache = {}  # domain -> DataFrame
     _brands_mem_cache = {}   # domain -> DataFrame
+    _load_lock = threading.Lock()
 
     @staticmethod
     def clear_mem_cache(domain = None):
@@ -269,124 +272,286 @@ class DataIngestion:
         if not force_fetch and domain in DataIngestion._catalog_mem_cache and domain in DataIngestion._brands_mem_cache:
             return DataIngestion._catalog_mem_cache[domain], DataIngestion._brands_mem_cache[domain]
 
+        with DataIngestion._load_lock:
+            # Double-check inside lock
+            if not force_fetch and domain in DataIngestion._catalog_mem_cache and domain in DataIngestion._brands_mem_cache:
+                return DataIngestion._catalog_mem_cache[domain], DataIngestion._brands_mem_cache[domain]
+
+            import sqlite3
+            conn = ensure_db_initialized()
+            
+            try:
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM catalog_items WHERE domain = ?", (domain,))
+                cat_count = cursor.fetchone()[0]
+                cursor.execute("SELECT COUNT(*) FROM brand_flavors WHERE domain = ?", (domain,))
+                brand_count = cursor.fetchone()[0]
+            except Exception as e:
+                logger.warning(f"[LOAD] [{domain.upper()}] SQLite check failed: {e}. Falling back to sheet fetch.")
+                cat_count = 0
+                brand_count = 0
+                
+            if not force_fetch and cat_count > 0 and brand_count > 0:
+                try:
+                    # Query catalog items
+                    cat_df = pd.read_sql_query("SELECT * FROM catalog_items WHERE domain = ?", conn, params=[domain])
+                    
+                    # Query brand flavors
+                    brands_df = pd.read_sql_query("SELECT * FROM brand_flavors WHERE domain = ?", conn, params=[domain])
+                    
+                    # Close DB connection
+                    conn.close()
+                    
+                    # Cleanup sqlite-specific column conversions
+                    entities_list = []
+                    for _, val in cat_df["entities_json"].items():
+                        if pd.isna(val) or not val:
+                            entities_list.append(None)
+                        else:
+                            try:
+                                parsed = json.loads(val)
+                                if isinstance(parsed, list):
+                                    res = []
+                                    for item in parsed:
+                                        if isinstance(item, dict):
+                                            res.append({k: set(v) if isinstance(v, list) else v for k, v in item.items()})
+                                        else:
+                                            res.append(item)
+                                    entities_list.append(res)
+                                else:
+                                    entities_list.append(parsed)
+                            except Exception:
+                                entities_list.append(None)
+                    cat_df["entities"] = entities_list
+
+                    # Convert weight_val from JSON string to tuple, or reconstruct if numeric float
+                    from engine.nlp.text_cleaner import TextPipeline
+                    weight_list = []
+                    for idx, val in cat_df["weight_val"].items():
+                        if pd.isna(val) or not val:
+                            weight_list.append(None)
+                        elif isinstance(val, (int, float)):
+                            # Reconstruct tuple from clean_text if SQLite had a raw float
+                            clean_t = cat_df.at[idx, "clean_text"]
+                            if pd.isna(clean_t) or not clean_t:
+                                weight_list.append((float(val), None, None))
+                            else:
+                                weight_list.append(TextPipeline.extract_weight_feature(clean_t))
+                        else:
+                            try:
+                                parsed = json.loads(str(val))
+                                weight_list.append(tuple(parsed) if isinstance(parsed, list) else parsed)
+                            except Exception:
+                                weight_list.append(None)
+                    cat_df["weight_val"] = weight_list
+                    
+                    # Rename columns back to DataFrame naming conventions
+                    cat_df = cat_df.rename(columns={
+                        "generic_keywords": "Generic keywords",
+                        "name": "Name",
+                        "price": "Price",
+                        "description": "Description"
+                    })
+                    
+                    if domain == config.DOMAIN_MARKET:
+                        cat_df = cat_df.rename(columns={"brand": "Brand"})
+                    else:
+                        cat_df = cat_df.rename(columns={"flavor": "Flavor"})
+                        
+                    # Restore stable name sequence UIDs (vectorized for speed)
+                    raw_names = cat_df["Name"].fillna("").astype(str).str.strip().str.lower()
+                    occ_counts = raw_names.groupby(raw_names).cumcount() + 1
+                    cat_df["db_uid"] = raw_names + "#occ_" + occ_counts.astype(str)
+                    
+                    # Sort out brand_flavors column names
+                    brands_df = brands_df.rename(columns={
+                        "name": "Flavor Name" if domain == config.DOMAIN_FOOD else "Brand Name",
+                        "aliases": "Aliases",
+                        "is_weak": "Is_Weak",
+                        "is_meat": "Is_Meat",
+                        "is_vegetable": "Is_Vegetable",
+                        "is_seafood": "Is_Seafood"
+                    })
+                    
+                    for col in ["Is_Weak", "Is_Meat", "Is_Vegetable", "Is_Seafood"]:
+                        if col in brands_df.columns:
+                            brands_df[col] = brands_df[col].astype(bool)
+                            
+                    logger.info(f"[LOAD] [{domain.upper()}] Read {len(cat_df)} catalog rows and {len(brands_df)} brands from SQLite database.")
+                    
+                    # Cache in Python memory
+                    DataIngestion._catalog_mem_cache[domain] = cat_df
+                    DataIngestion._brands_mem_cache[domain] = brands_df
+                    
+                    # Ensure dictionary counts are initialized in SQLite
+                    try:
+                        chk_conn = ensure_db_initialized()
+                        chk_cur = chk_conn.cursor()
+                        chk_cur.execute("SELECT COALESCE(SUM(catalog_count), 0) FROM classifier_dictionaries WHERE domain = ?", (domain,))
+                        dict_count_sum = chk_cur.fetchone()[0]
+                        if dict_count_sum == 0:
+                            DataIngestion.compute_and_store_dictionary_counts(domain, cat_df=cat_df, conn=chk_conn)
+                        chk_conn.close()
+                    except Exception as cnt_err:
+                        logger.warning(f"[LOAD] [{domain.upper()}] Could not check dictionary counts: {cnt_err}")
+
+                    return cat_df, brands_df
+                except Exception as e:
+                    logger.error(f"[LOAD] [{domain.upper()}] Failed to query SQL tables: {e}. Falling back to fetch...")
+                    if conn:
+                        conn.close()
+
+            return DataIngestion.load_catalog_from_sheets(sheet_id, domain)
+
+    @staticmethod
+    def compute_and_store_dictionary_counts(domain: str, cat_df: Optional[pd.DataFrame] = None, conn: Optional[sqlite3.Connection] = None):
+        """
+        Precomputes the occurrence frequencies of all dictionary tags (GK, BT, Category/Region, Brands/Flavors, BT-GK map)
+        across catalog items and persists the counts directly into SQLite tables.
+        """
         import sqlite3
-        conn = ensure_db_initialized()
+        from collections import Counter
         
+        close_conn = False
+        if conn is None:
+            conn = ensure_db_initialized()
+            close_conn = True
+            
         try:
             cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM catalog_items WHERE domain = ?", (domain,))
-            cat_count = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM brand_flavors WHERE domain = ?", (domain,))
-            brand_count = cursor.fetchone()[0]
-        except Exception as e:
-            logger.warning(f"[LOAD] [{domain.upper()}] SQLite check failed: {e}. Falling back to sheet fetch.")
-            cat_count = 0
-            brand_count = 0
             
-        if not force_fetch and cat_count > 0 and brand_count > 0:
-            try:
-                # Query catalog items
-                cat_df = pd.read_sql_query("SELECT * FROM catalog_items WHERE domain = ?", conn, params=[domain])
-                
-                # Query brand flavors
-                brands_df = pd.read_sql_query("SELECT * FROM brand_flavors WHERE domain = ?", conn, params=[domain])
-                
-                # Close DB connection
-                conn.close()
-                
-                # Cleanup sqlite-specific column conversions
-                entities_list = []
-                for _, val in cat_df["entities_json"].items():
-                    if pd.isna(val) or not val:
-                        entities_list.append(None)
-                    else:
-                        try:
-                            parsed = json.loads(val)
-                            if isinstance(parsed, list):
-                                res = []
-                                for item in parsed:
-                                    if isinstance(item, dict):
-                                        res.append({k: set(v) if isinstance(v, list) else v for k, v in item.items()})
-                                    else:
-                                        res.append(item)
-                                entities_list.append(res)
-                            else:
-                                entities_list.append(parsed)
-                        except Exception:
-                            entities_list.append(None)
-                cat_df["entities"] = entities_list
-
-                # Convert weight_val from JSON string to tuple, or reconstruct if numeric float
-                from engine.nlp.text_cleaner import TextPipeline
-                weight_list = []
-                for idx, val in cat_df["weight_val"].items():
-                    if pd.isna(val) or not val:
-                        weight_list.append(None)
-                    elif isinstance(val, (int, float)):
-                        # Reconstruct tuple from clean_text if SQLite had a raw float
-                        clean_t = cat_df.at[idx, "clean_text"]
-                        if pd.isna(clean_t) or not clean_t:
-                            weight_list.append((float(val), None, None))
-                        else:
-                            weight_list.append(TextPipeline.extract_weight_feature(clean_t))
-                    else:
-                        try:
-                            parsed = json.loads(str(val))
-                            weight_list.append(tuple(parsed) if isinstance(parsed, list) else parsed)
-                        except Exception:
-                            weight_list.append(None)
-                cat_df["weight_val"] = weight_list
-                
-                # Rename columns back to DataFrame naming conventions
-                cat_df = cat_df.rename(columns={
-                    "generic_keywords": "Generic keywords",
-                    "name": "Name",
-                    "price": "Price",
-                    "description": "Description"
-                })
-                
-                if domain == config.DOMAIN_MARKET:
-                    cat_df = cat_df.rename(columns={"brand": "Brand"})
+            cat_col = "category" if domain == config.DOMAIN_MARKET else "region"
+            brand_col = "Brand" if domain == config.DOMAIN_MARKET else "Flavor"
+            brand_db_col = "brand" if domain == config.DOMAIN_MARKET else "flavor"
+            
+            # Compute counters
+            gk_c = Counter()
+            bt_c = Counter()
+            cat_c = Counter()
+            brand_c = Counter()
+            
+            if cat_df is not None and len(cat_df) > 0:
+                if "Generic keywords" in cat_df.columns:
+                    for gks in cat_df["Generic keywords"].dropna():
+                        for item in str(gks).split(","):
+                            t = item.strip().lower()
+                            if t:
+                                gk_c[t] += 1
+                if "basictype" in cat_df.columns:
+                    for bts in cat_df["basictype"].dropna():
+                        for item in str(bts).split(","):
+                            t = item.strip().lower()
+                            if t:
+                                bt_c[t] += 1
+                if cat_col in cat_df.columns:
+                    for cats in cat_df[cat_col].dropna():
+                        t = str(cats).strip().lower()
+                        if t:
+                            cat_c[t] += 1
+                if brand_col in cat_df.columns:
+                    for brs in cat_df[brand_col].dropna():
+                        for item in str(brs).split(","):
+                            t = item.strip().lower()
+                            if t:
+                                brand_c[t] += 1
+            else:
+                cursor.execute(f"SELECT generic_keywords, basictype, {cat_col}, {brand_db_col} FROM catalog_items WHERE domain = ?", (domain,))
+                for gks, bts, cats, brs in cursor.fetchall():
+                    if gks:
+                        for item in str(gks).split(","):
+                            t = item.strip().lower()
+                            if t:
+                                gk_c[t] += 1
+                    if bts:
+                        for item in str(bts).split(","):
+                            t = item.strip().lower()
+                            if t:
+                                bt_c[t] += 1
+                    if cats:
+                        t = str(cats).strip().lower()
+                        if t:
+                            cat_c[t] += 1
+                    if brs:
+                        for item in str(brs).split(","):
+                            t = item.strip().lower()
+                            if t:
+                                brand_c[t] += 1
+                            
+            # 1. Update classifier_dictionaries
+            cursor.execute("SELECT id, tag_type, tag FROM classifier_dictionaries WHERE domain = ?", (domain,))
+            dict_rows = cursor.fetchall()
+            dict_updates = []
+            for row_id, tag_type, tag in dict_rows:
+                t = tag.strip().lower()
+                if tag_type == "gk":
+                    cnt = gk_c.get(t, 0)
+                elif tag_type == "bt":
+                    cnt = bt_c.get(t, 0)
                 else:
-                    cat_df = cat_df.rename(columns={"flavor": "Flavor"})
+                    cnt = cat_c.get(t, 0)
+                dict_updates.append((cnt, row_id))
+            if dict_updates:
+                cursor.executemany("UPDATE classifier_dictionaries SET catalog_count = ? WHERE id = ?", dict_updates)
+                
+            # 2. Update brand_flavors
+            cursor.execute("SELECT id, name FROM brand_flavors WHERE domain = ?", (domain,))
+            brand_rows = cursor.fetchall()
+            brand_updates = []
+            for row_id, name in brand_rows:
+                cnt = brand_c.get(name.strip().lower(), 0)
+                brand_updates.append((cnt, row_id))
+            if brand_updates:
+                cursor.executemany("UPDATE brand_flavors SET catalog_count = ? WHERE id = ?", brand_updates)
+                
+            # 3. Ensure bt_gk_map is populated and updated
+            cursor.execute("SELECT COUNT(*) FROM bt_gk_map WHERE domain = ?", (domain,))
+            bt_gk_count = cursor.fetchone()[0]
+            
+            if bt_gk_count == 0:
+                # Try loading from disk cache PKL or sheets
+                pkl_path = os.path.join(config.CACHE_DIR, f"{domain}_bt_gk_cache.pkl")
+                cached_map = {}
+                if os.path.exists(pkl_path):
+                    try:
+                        import joblib
+                        cached_data = joblib.load(pkl_path)
+                        cached_map = cached_data.get("bt_gk_map", {})
+                    except Exception as e:
+                        logger.warning(f"[LOAD] Could not read {pkl_path}: {e}")
+                if cached_map:
+                    inserts = []
+                    for bt, gks in cached_map.items():
+                        gks_list = gks if isinstance(gks, list) else [gks]
+                        gks_str = ", ".join(gks_list)
+                        gk_cnt = len(gks_list)
+                        cat_cnt = bt_c.get(bt.strip().lower(), 0)
+                        inserts.append((domain, bt, gks_str, gk_cnt, cat_cnt))
+                    cursor.executemany(
+                        "INSERT INTO bt_gk_map (domain, basictype, generic_keywords, gk_count, catalog_count) VALUES (?, ?, ?, ?, ?)",
+                        inserts
+                    )
+            else:
+                # Update catalog_count on existing bt_gk_map rows
+                cursor.execute("SELECT id, basictype, generic_keywords FROM bt_gk_map WHERE domain = ?", (domain,))
+                map_rows = cursor.fetchall()
+                map_updates = []
+                for row_id, bt, gks in map_rows:
+                    cat_cnt = bt_c.get(bt.strip().lower(), 0)
+                    gk_cnt = len([k for k in str(gks).split(",") if k.strip()])
+                    map_updates.append((cat_cnt, gk_cnt, row_id))
+                if map_updates:
+                    cursor.executemany("UPDATE bt_gk_map SET catalog_count = ?, gk_count = ? WHERE id = ?", map_updates)
                     
-                # Restore stable name sequence UIDs
-                name_counts = {}
-                db_uids = []
-                for idx, row in cat_df.iterrows():
-                    raw_name = str(row.get("Name", "")).strip().lower()
-                    name_counts[raw_name] = name_counts.get(raw_name, 0) + 1
-                    uid = f"{raw_name}#occ_{name_counts[raw_name]}"
-                    db_uids.append(uid)
-                cat_df["db_uid"] = db_uids
-                
-                # Sort out brand_flavors column names
-                brands_df = brands_df.rename(columns={
-                    "name": "Flavor Name" if domain == config.DOMAIN_FOOD else "Brand Name",
-                    "aliases": "Aliases",
-                    "is_weak": "Is_Weak",
-                    "is_meat": "Is_Meat",
-                    "is_vegetable": "Is_Vegetable",
-                    "is_seafood": "Is_Seafood"
-                })
-                
-                for col in ["Is_Weak", "Is_Meat", "Is_Vegetable", "Is_Seafood"]:
-                    if col in brands_df.columns:
-                        brands_df[col] = brands_df[col].astype(bool)
-                        
-                logger.info(f"[LOAD] [{domain.upper()}] Read {len(cat_df)} catalog rows and {len(brands_df)} brands from SQLite database.")
-                
-                # Cache in Python memory
-                DataIngestion._catalog_mem_cache[domain] = cat_df
-                DataIngestion._brands_mem_cache[domain] = brands_df
-                
-                return cat_df, brands_df
-            except Exception as e:
-                logger.error(f"[LOAD] [{domain.upper()}] Failed to query SQL tables: {e}. Falling back to fetch...")
-                if conn:
-                    conn.close()
+            conn.commit()
+            logger.info(f"[LOAD] [{domain.upper()}] Precomputed and stored dictionary counts in SQLite (GK: {len(gk_c)}, BT: {len(bt_c)}, Brands: {len(brand_c)}).")
+        except Exception as e:
+            logger.error(f"[LOAD] [{domain.upper()}] Failed to compute/store dictionary counts: {e}")
+            if conn:
+                conn.rollback()
+        finally:
+            if close_conn and conn:
+                conn.close()
 
-        return DataIngestion.load_catalog_from_sheets(sheet_id, domain)
 
     @staticmethod
     def load_catalog_from_sheets(sheet_id: str, domain: str = config.DOMAIN_MARKET) -> Tuple[pd.DataFrame, pd.DataFrame]:

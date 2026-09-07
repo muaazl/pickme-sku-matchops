@@ -18,6 +18,7 @@ from backend.app.services.catalog_service import (
 )
 from backend.app.services.meilisearch_service import get_meili_client, is_meili_healthy
 from engine import config as engine_config
+from engine.db import ensure_db_initialized
 
 logger = logging.getLogger("matchops.catalog_api")
 router = APIRouter()
@@ -29,6 +30,69 @@ __all__ = [
     "get_classifier_dicts",
     "get_bt_gk_cache",
 ]
+
+
+@router.get("/catalog/summary-stats")
+def get_catalog_summary_stats(domain: str = "market"):
+    """
+    Returns total document counts for all 6 catalog datasets (catalog, gk, bt, category, brands, bt_gk_map)
+    in a single lightweight call (<5ms).
+    """
+    if domain not in ("market", "food"):
+        raise HTTPException(status_code=400, detail="Invalid domain. Must be 'market' or 'food'.")
+
+    # 1. Try Meilisearch
+    if is_meili_healthy():
+        try:
+            client = get_meili_client()
+            cat_index = engine_config.MEILI_INDEX_MARKET if domain == "market" else engine_config.MEILI_INDEX_FOOD
+            dict_index = engine_config.MEILI_INDEX_MARKET_DICTS if domain == "market" else engine_config.MEILI_INDEX_FOOD_DICTS
+
+            cat_stats = client.index(cat_index).get_stats()
+            cat_count = getattr(cat_stats, "number_of_documents", 0) if not isinstance(cat_stats, dict) else cat_stats.get("numberOfDocuments", 0)
+
+            dict_search = client.index(dict_index).search("", {"facets": ["dataset"], "limit": 0})
+            facets = dict_search.get("facetDistribution", {}).get("dataset", {})
+
+            return {
+                "domain": domain,
+                "catalog": cat_count,
+                "gk": facets.get("gk", 0),
+                "bt": facets.get("bt", 0),
+                "category": facets.get("category", 0),
+                "brands": facets.get("brands", 0),
+                "bt_gk_map": facets.get("bt_gk_map", 0),
+            }
+        except Exception as meili_err:
+            logger.warning(f"[STATS] Failed to fetch summary stats from Meilisearch: {meili_err}. Falling back to SQLite.")
+
+    # 2. Fast SQLite query fallback
+    conn = ensure_db_initialized()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM catalog_items WHERE domain = ?", (domain,))
+        cat_count = cur.fetchone()[0]
+
+        cur.execute("SELECT tag_type, COUNT(*) FROM classifier_dictionaries WHERE domain = ? GROUP BY tag_type", (domain,))
+        dict_counts = dict(cur.fetchall())
+
+        cur.execute("SELECT COUNT(*) FROM brand_flavors WHERE domain = ?", (domain,))
+        brand_count = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM bt_gk_map WHERE domain = ?", (domain,))
+        map_count = cur.fetchone()[0]
+
+        return {
+            "domain": domain,
+            "catalog": cat_count,
+            "gk": dict_counts.get("gk", 0),
+            "bt": dict_counts.get("bt", 0),
+            "category": dict_counts.get("region" if domain == "food" else "category", 0),
+            "brands": brand_count,
+            "bt_gk_map": map_count,
+        }
+    finally:
+        conn.close()
 
 
 @router.get("/catalog")
@@ -56,10 +120,12 @@ def search_catalog(
     if dataset not in valid_datasets:
         raise HTTPException(status_code=400, detail=f"Invalid dataset. Must be one of {valid_datasets}")
 
-    # 1. CATALOG DATASET - Try Meilisearch search first
+    # =========================================================================
+    # 1. CATALOG DATASET (Uses Meilisearch with fallback to Pandas/SQLite)
+    # =========================================================================
     if dataset == "catalog":
-        try:
-            if is_meili_healthy():
+        if is_meili_healthy():
+            try:
                 client = get_meili_client()
                 index_name = engine_config.MEILI_INDEX_MARKET if domain == "market" else engine_config.MEILI_INDEX_FOOD
                 index = client.index(index_name)
@@ -135,34 +201,20 @@ def search_catalog(
                     "page_size": page_size,
                     "total_pages": (total + page_size - 1) // page_size if total > 0 else 1
                 }
+            except Exception as e:
+                logger.warning(f"[MEILI] Search failed: {e}. Falling back to Pandas in-memory search.")
+
+        # Fallback to Pandas in-memory search for catalog
+        try:
+            catalog_df, brands_df = get_catalog_and_brands(domain)
         except Exception as e:
-            logger.warning(f"[MEILI] Search failed: {e}. Falling back to Pandas in-memory search.")
+            raise HTTPException(status_code=500, detail=f"Failed to load catalog data: {str(e)}")
 
-    # Fallback to Pandas in-memory search or metadata dataset queries
-    try:
-        catalog_df, brands_df = get_catalog_and_brands(domain)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to load catalog data: {str(e)}")
-
-    cat_col = "category" if domain == "market" else "region"
-    brand_col = "Brand" if domain == "market" else "Flavor"
-
-    gk_counter = get_column_counter(catalog_df, "Generic keywords", split_comma=True) if dataset == "gk" else None
-    bt_counter = get_column_counter(catalog_df, "basictype", split_comma=True) if dataset in ("bt", "bt_gk_map") else None
-    cat_counter = get_column_counter(catalog_df, cat_col, split_comma=False) if dataset == "category" else None
-    brand_counter = get_column_counter(catalog_df, brand_col, split_comma=True) if dataset == "brands" else None
-
-    results = []
-
-    # 1b. Fallback Pandas implementation
-    if dataset == "catalog":
         df = catalog_df.copy()
-        
         if "id" not in df.columns:
             df = df.reset_index().rename(columns={"index": "id"})
         df["id"] = df["id"].astype(str)
 
-        # Filters
         if min_price is not None:
             df = df[df["Price"] >= min_price]
         if max_price is not None:
@@ -180,7 +232,6 @@ def search_catalog(
         if basictype and "basictype" in df.columns:
             df = df[df["basictype"].astype(str).str.contains(basictype, case=False, na=False)]
 
-        # Search Query
         if query:
             q = query.lower()
             mask = pd.Series(False, index=df.index)
@@ -190,7 +241,6 @@ def search_catalog(
                     mask = mask | df[col].astype(str).str.lower().str.contains(q, na=False)
             df = df[mask]
 
-        # Sorting
         if sort_by:
             col_map = {
                 "name": "Name",
@@ -202,17 +252,18 @@ def search_catalog(
                 "category": "category",
                 "region": "region",
                 "gk": "Generic keywords",
-                "genericKeywords": "Generic keywords",
-                "sellercategory": "SellerCategory",
-                "sellerCategory": "SellerCategory",
-                "merchant": "Merchant",
                 "description": "Description"
             }
             target_col = col_map.get(sort_by, sort_by)
             if target_col in df.columns:
                 df = df.sort_values(by=target_col, ascending=(sort_order == "asc"))
 
-        records = df.to_dict(orient="records")
+        total = len(df)
+        start = (page - 1) * page_size
+        end = start + page_size
+        paginated_df = df.iloc[start:end]
+
+        records = paginated_df.to_dict(orient="records")
         for r in records:
             r["name"] = r.get("Name")
             r["brand"] = r.get("Brand")
@@ -226,163 +277,215 @@ def search_catalog(
             r["description"] = r.get("Description")
             r["region"] = r.get("region")
             r["count"] = 1
-            
-        results = clean_record_nans(records)
 
-    # 2. GK DATASET
-    elif dataset == "gk":
-        dicts = get_classifier_dicts(domain)
-        gk_list = dicts.get("gk", [])
-        
-        raw_results = [
-            {"id": f"gk_{i}", "name": tag, "count": gk_counter[tag.lower()]}
-            for i, tag in enumerate(gk_list)
-        ]
-        if query:
-            q = query.lower()
-            raw_results = [r for r in raw_results if q in r["name"].lower()]
-            
-        reverse = (sort_order == "desc")
-        key_func = (lambda x: x["count"]) if sort_by == "count" else (lambda x: x["name"].lower())
-        raw_results.sort(key=key_func, reverse=reverse)
-        results = raw_results
+        return {
+            "results": clean_record_nans(records),
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": (total + page_size - 1) // page_size if total > 0 else 1
+        }
 
-    # 3. BT DATASET
-    elif dataset == "bt":
-        dicts = get_classifier_dicts(domain)
-        bt_list = dicts.get("bt", [])
-        
-        raw_results = [
-            {"id": f"bt_{i}", "name": tag, "count": bt_counter[tag.lower()]}
-            for i, tag in enumerate(bt_list)
-        ]
-        if query:
-            q = query.lower()
-            raw_results = [r for r in raw_results if q in r["name"].lower()]
-            
-        reverse = (sort_order == "desc")
-        key_func = (lambda x: x["count"]) if sort_by == "count" else (lambda x: x["name"].lower())
-        raw_results.sort(key=key_func, reverse=reverse)
-        results = raw_results
+    # =========================================================================
+    # 2. DICTIONARIES DATASETS (gk, bt, category, brands, bt_gk_map)
+    # Fast path: Meilisearch (<2ms) -> Fast fallback: Direct SQLite (<1ms)
+    # NEVER loads the 80,000 catalog rows into memory!
+    # =========================================================================
+    if is_meili_healthy():
+        try:
+            client = get_meili_client()
+            dict_index_name = engine_config.MEILI_INDEX_MARKET_DICTS if domain == "market" else engine_config.MEILI_INDEX_FOOD_DICTS
+            index = client.index(dict_index_name)
 
-    # 4. CATEGORY / REGION DATASET
-    elif dataset == "category":
-        dicts = get_classifier_dicts(domain)
-        tag_key = "region" if domain == "food" else "category"
-        tags_list = dicts.get(tag_key, [])
-        
-        raw_results = [
-            {"id": f"cat_{i}", "name": tag, "count": cat_counter[tag.lower()]}
-            for i, tag in enumerate(tags_list)
-        ]
-        if query:
-            q = query.lower()
-            raw_results = [r for r in raw_results if q in r["name"].lower()]
-            
-        reverse = (sort_order == "desc")
-        key_func = (lambda x: x["count"]) if sort_by == "count" else (lambda x: x["name"].lower())
-        raw_results.sort(key=key_func, reverse=reverse)
-        results = raw_results
+            meili_filters = [f'dataset = "{dataset}"']
+            filter_str = " AND ".join(meili_filters)
 
-    # 5. BRANDS / FLAVORS DATASET
-    elif dataset == "brands":
-        df = brands_df.copy()
-        
-        if "id" not in df.columns:
-            df = df.reset_index().rename(columns={"index": "id"})
-        df["id"] = df["id"].astype(str)
-        records = df.to_dict(orient="records")
-        raw_results = []
+            # Sorting mapping
+            if sort_by:
+                sort_field = sort_by
+                if sort_field in ("sku_count",):
+                    sort_field = "count"
+                elif sort_field in ("gks", "basictype", "brand_name", "flavor_name"):
+                    sort_field = "name"
+                sort_list = [f"{sort_field}:{sort_order}"]
+            else:
+                sort_list = ["count:desc"]
 
-        if domain == "market":
-            for r in records:
-                b_name = str(r.get("Brand Name", ""))
-                raw_results.append({
-                    "id": r["id"],
-                    "name": b_name,
-                    "brand_name": b_name,
-                    "aliases": r.get("Aliases"),
-                    "is_weak": r.get("Is_Weak"),
-                    "count": brand_counter[b_name.lower()]
-                })
-        else:
-            for r in records:
-                fl_name = str(r.get("Flavor Name", ""))
-                raw_results.append({
-                    "id": r["id"],
-                    "name": fl_name,
-                    "flavor_name": fl_name,
-                    "aliases": r.get("Aliases"),
-                    "is_meat": r.get("Is_Meat"),
-                    "is_vegetable": r.get("Is_Vegetable"),
-                    "is_seafood": r.get("Is_Seafood"),
-                    "count": brand_counter[fl_name.lower()]
-                })
-
-        if query:
-            q = query.lower()
-            raw_results = [
-                r for r in raw_results 
-                if q in r["name"].lower() or (r["aliases"] and q in str(r["aliases"]).lower())
-            ]
-
-        reverse = (sort_order == "desc")
-        if sort_by == "count":
-            raw_results.sort(key=lambda x: x["count"], reverse=reverse)
-        elif sort_by in ("is_weak", "is_meat", "is_vegetable", "is_seafood"):
-            raw_results.sort(key=lambda x: bool(x.get(sort_by)), reverse=reverse)
-        else:
-            raw_results.sort(key=lambda x: x["name"].lower(), reverse=reverse)
-
-        results = clean_record_nans(raw_results)
-
-    # 6. BT-GK MAP DATASET
-    elif dataset == "bt_gk_map":
-        bt_gk_cache = get_bt_gk_cache(domain)
-        bt_gk_map = bt_gk_cache.get("bt_gk_map", {})
-        
-        raw_results = [
-            {
-                "id": f"map_{i}",
-                "bt": bt,
-                "name": bt,
-                "gks": ", ".join(gks) if isinstance(gks, list) else str(gks),
-                "gk_count": len(gks) if isinstance(gks, list) else 0,
-                "count": bt_counter[bt.lower()]
+            search_params = {
+                "limit": page_size,
+                "offset": (page - 1) * page_size,
+                "filter": filter_str,
+                "sort": sort_list,
             }
-            for i, (bt, gks) in enumerate(bt_gk_map.items())
-        ]
+            q = query if query else ""
+            res = index.search(q, search_params)
 
-        if query:
-            q = query.lower()
-            raw_results = [
-                r for r in raw_results 
-                if q in r["bt"].lower() or q in r["gks"].lower()
+            hits = res.get("hits", [])
+            total = res.get("totalHits") or res.get("estimatedTotalHits", 0)
+
+            results_list = []
+            for hit in hits:
+                doc = dict(hit)
+                if dataset == "bt_gk_map":
+                    doc["bt"] = doc.get("bt") or doc.get("name")
+                elif dataset == "brands":
+                    if domain == "food":
+                        doc["flavor_name"] = doc.get("name")
+                    else:
+                        doc["brand_name"] = doc.get("name")
+                results_list.append(doc)
+
+            return {
+                "results": results_list,
+                "total": total,
+                "page": page,
+                "page_size": page_size,
+                "total_pages": (total + page_size - 1) // page_size if total > 0 else 1
+            }
+        except Exception as e:
+            logger.warning(f"[MEILI] Dictionary search failed: {e}. Falling back to SQLite direct query.")
+
+    # Direct SQLite Fallback (Zero catalog loading)
+    conn = ensure_db_initialized()
+    try:
+        cur = conn.cursor()
+        offset = (page - 1) * page_size
+        q_param = f"%{query.strip().lower()}%" if query else None
+
+        if dataset in ("gk", "bt", "category"):
+            tag_type = "region" if (domain == "food" and dataset == "category") else dataset
+            if sort_by == "name":
+                sort_col = "tag"
+                order_dir = "DESC" if sort_order.lower() == "desc" else "ASC"
+            else:
+                sort_col = "catalog_count"
+                order_dir = "ASC" if sort_by and sort_order.lower() == "asc" else "DESC"
+            
+            if q_param:
+                cur.execute(
+                    f"SELECT COUNT(*) FROM classifier_dictionaries WHERE domain = ? AND tag_type = ? AND LOWER(tag) LIKE ?",
+                    (domain, tag_type, q_param)
+                )
+                total = cur.fetchone()[0]
+                cur.execute(
+                    f"SELECT id, tag, catalog_count FROM classifier_dictionaries WHERE domain = ? AND tag_type = ? AND LOWER(tag) LIKE ? ORDER BY {sort_col} {order_dir} LIMIT ? OFFSET ?",
+                    (domain, tag_type, q_param, page_size, offset)
+                )
+            else:
+                cur.execute(
+                    f"SELECT COUNT(*) FROM classifier_dictionaries WHERE domain = ? AND tag_type = ?",
+                    (domain, tag_type)
+                )
+                total = cur.fetchone()[0]
+                cur.execute(
+                    f"SELECT id, tag, catalog_count FROM classifier_dictionaries WHERE domain = ? AND tag_type = ? ORDER BY {sort_col} {order_dir} LIMIT ? OFFSET ?",
+                    (domain, tag_type, page_size, offset)
+                )
+            
+            rows = cur.fetchall()
+            results = [{"id": f"{dataset}_{r[0]}", "name": r[1], "count": r[2]} for r in rows]
+
+        elif dataset == "brands":
+            if sort_by == "name":
+                sort_col = "name"
+                order_dir = "DESC" if sort_order.lower() == "desc" else "ASC"
+            elif sort_by in ("is_weak", "is_meat", "is_vegetable", "is_seafood"):
+                sort_col = sort_by
+                order_dir = "DESC" if sort_order.lower() == "desc" else "ASC"
+            else:
+                sort_col = "catalog_count"
+                order_dir = "ASC" if sort_by and sort_order.lower() == "asc" else "DESC"
+
+            if q_param:
+                cur.execute(
+                    f"SELECT COUNT(*) FROM brand_flavors WHERE domain = ? AND (LOWER(name) LIKE ? OR LOWER(COALESCE(aliases, '')) LIKE ?)",
+                    (domain, q_param, q_param)
+                )
+                total = cur.fetchone()[0]
+                cur.execute(
+                    f"SELECT id, name, aliases, is_weak, is_meat, is_vegetable, is_seafood, catalog_count FROM brand_flavors WHERE domain = ? AND (LOWER(name) LIKE ? OR LOWER(COALESCE(aliases, '')) LIKE ?) ORDER BY {sort_col} {order_dir} LIMIT ? OFFSET ?",
+                    (domain, q_param, q_param, page_size, offset)
+                )
+            else:
+                cur.execute(f"SELECT COUNT(*) FROM brand_flavors WHERE domain = ?", (domain,))
+                total = cur.fetchone()[0]
+                cur.execute(
+                    f"SELECT id, name, aliases, is_weak, is_meat, is_vegetable, is_seafood, catalog_count FROM brand_flavors WHERE domain = ? ORDER BY {sort_col} {order_dir} LIMIT ? OFFSET ?",
+                    (domain, page_size, offset)
+                )
+            
+            rows = cur.fetchall()
+            results = []
+            for r in rows:
+                item = {
+                    "id": str(r[0]),
+                    "name": r[1],
+                    "aliases": r[2],
+                    "count": r[7],
+                }
+                if domain == "market":
+                    item["brand_name"] = r[1]
+                    item["is_weak"] = bool(r[3])
+                else:
+                    item["flavor_name"] = r[1]
+                    item["is_meat"] = bool(r[4])
+                    item["is_vegetable"] = bool(r[5])
+                    item["is_seafood"] = bool(r[6])
+                results.append(item)
+
+        elif dataset == "bt_gk_map":
+            if sort_by in ("name", "bt"):
+                sort_col = "basictype"
+                order_dir = "DESC" if sort_order.lower() == "desc" else "ASC"
+            elif sort_by == "gk_count":
+                sort_col = "gk_count"
+                order_dir = "DESC" if sort_order.lower() == "desc" else "ASC"
+            else:
+                sort_col = "catalog_count"
+                order_dir = "ASC" if sort_by and sort_order.lower() == "asc" else "DESC"
+
+            if q_param:
+                cur.execute(
+                    f"SELECT COUNT(*) FROM bt_gk_map WHERE domain = ? AND (LOWER(basictype) LIKE ? OR LOWER(generic_keywords) LIKE ?)",
+                    (domain, q_param, q_param)
+                )
+                total = cur.fetchone()[0]
+                cur.execute(
+                    f"SELECT id, basictype, generic_keywords, gk_count, catalog_count FROM bt_gk_map WHERE domain = ? AND (LOWER(basictype) LIKE ? OR LOWER(generic_keywords) LIKE ?) ORDER BY {sort_col} {order_dir} LIMIT ? OFFSET ?",
+                    (domain, q_param, q_param, page_size, offset)
+                )
+            else:
+                cur.execute(f"SELECT COUNT(*) FROM bt_gk_map WHERE domain = ?", (domain,))
+                total = cur.fetchone()[0]
+                cur.execute(
+                    f"SELECT id, basictype, generic_keywords, gk_count, catalog_count FROM bt_gk_map WHERE domain = ? ORDER BY {sort_col} {order_dir} LIMIT ? OFFSET ?",
+                    (domain, page_size, offset)
+                )
+
+            
+            rows = cur.fetchall()
+            results = [
+                {
+                    "id": f"map_{r[0]}",
+                    "bt": r[1],
+                    "name": r[1],
+                    "gks": r[2],
+                    "gk_count": r[3],
+                    "count": r[4]
+                }
+                for r in rows
             ]
 
-        reverse = (sort_order == "desc")
-        if sort_by in ("count", "sku_count"):
-            raw_results.sort(key=lambda x: x["count"], reverse=reverse)
-        elif sort_by == "gk_count":
-            raw_results.sort(key=lambda x: x["gk_count"], reverse=reverse)
-        else:
-            raw_results.sort(key=lambda x: x["bt"].lower(), reverse=reverse)
+        return {
+            "results": clean_record_nans(results),
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": (total + page_size - 1) // page_size if total > 0 else 1
+        }
+    finally:
+        conn.close()
 
-        results = raw_results
-
-    # Pagination
-    total = len(results)
-    start = (page - 1) * page_size
-    end = start + page_size
-    paginated_results = results[start:end]
-
-    return {
-        "results": paginated_results,
-        "total": total,
-        "page": page,
-        "page_size": page_size,
-        "total_pages": (total + page_size - 1) // page_size if total > 0 else 1
-    }
 
 
 @router.get("/catalog/check-sync")

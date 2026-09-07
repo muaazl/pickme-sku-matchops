@@ -140,6 +140,7 @@ CREATE TABLE IF NOT EXISTS brand_flavors (
   is_meat INTEGER DEFAULT 0,
   is_vegetable INTEGER DEFAULT 0,
   is_seafood INTEGER DEFAULT 0,
+  catalog_count INTEGER DEFAULT 0,
   row_hash TEXT NOT NULL
 );
 
@@ -148,7 +149,9 @@ CREATE TABLE IF NOT EXISTS classifier_dictionaries (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   domain TEXT NOT NULL,
   tag_type TEXT NOT NULL,
-  tag TEXT NOT NULL
+  tag TEXT NOT NULL,
+  catalog_count INTEGER DEFAULT 0,
+  metadata_json TEXT
 );
 
 -- 9. BT-GK mapping rules table
@@ -156,7 +159,9 @@ CREATE TABLE IF NOT EXISTS bt_gk_map (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   domain TEXT NOT NULL,
   basictype TEXT NOT NULL,
-  generic_keywords TEXT NOT NULL
+  generic_keywords TEXT NOT NULL,
+  gk_count INTEGER DEFAULT 0,
+  catalog_count INTEGER DEFAULT 0
 );
 
 -- Indexes
@@ -169,8 +174,11 @@ CREATE INDEX IF NOT EXISTS idx_api_requests_created_at ON api_requests(created_a
 CREATE INDEX IF NOT EXISTS idx_catalog_items_domain ON catalog_items(domain);
 CREATE INDEX IF NOT EXISTS idx_catalog_items_domain_hash ON catalog_items(domain, row_hash);
 CREATE INDEX IF NOT EXISTS idx_brand_flavors_domain ON brand_flavors(domain);
+CREATE INDEX IF NOT EXISTS idx_brand_flavors_count ON brand_flavors(domain, catalog_count DESC);
 CREATE INDEX IF NOT EXISTS idx_classifier_dict_domain ON classifier_dictionaries(domain, tag_type);
+CREATE INDEX IF NOT EXISTS idx_classifier_dict_lookup ON classifier_dictionaries(domain, tag_type, catalog_count DESC);
 CREATE INDEX IF NOT EXISTS idx_bt_gk_map_domain ON bt_gk_map(domain, basictype);
+CREATE INDEX IF NOT EXISTS idx_bt_gk_map_count ON bt_gk_map(domain, catalog_count DESC);
 CREATE INDEX IF NOT EXISTS idx_processed_skus_created_at ON processed_skus(created_at);
 CREATE INDEX IF NOT EXISTS idx_processed_skus_batch_id ON processed_skus(batch_id);
 CREATE INDEX IF NOT EXISTS idx_processed_skus_domain_created ON processed_skus(domain, created_at);

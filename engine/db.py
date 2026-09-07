@@ -147,6 +147,7 @@ CREATE TABLE IF NOT EXISTS brand_flavors (
     is_meat INTEGER DEFAULT 0,
     is_vegetable INTEGER DEFAULT 0,
     is_seafood INTEGER DEFAULT 0,
+    catalog_count INTEGER DEFAULT 0,
     row_hash TEXT NOT NULL
 );
 
@@ -155,7 +156,9 @@ CREATE TABLE IF NOT EXISTS classifier_dictionaries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     domain TEXT NOT NULL,
     tag_type TEXT NOT NULL,
-    tag TEXT NOT NULL
+    tag TEXT NOT NULL,
+    catalog_count INTEGER DEFAULT 0,
+    metadata_json TEXT
 );
 
 -- 8. BT to GK Map
@@ -163,7 +166,9 @@ CREATE TABLE IF NOT EXISTS bt_gk_map (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     domain TEXT NOT NULL,
     basictype TEXT NOT NULL,
-    generic_keywords TEXT NOT NULL
+    generic_keywords TEXT NOT NULL,
+    gk_count INTEGER DEFAULT 0,
+    catalog_count INTEGER DEFAULT 0
 );
 
 -- 9. Indexes for Performance
@@ -243,6 +248,33 @@ def ensure_db_initialized(conn_or_path=None) -> sqlite3.Connection:
         for col_name, col_type in new_cols_skus.items():
             if col_name not in sku_cols:
                 conn.execute(f"ALTER TABLE processed_skus ADD COLUMN {col_name} {col_type};")
+
+        # classifier_dictionaries columns
+        cursor.execute("PRAGMA table_info(classifier_dictionaries);")
+        dict_cols = [row[1] for row in cursor.fetchall()]
+        if "catalog_count" not in dict_cols:
+            conn.execute("ALTER TABLE classifier_dictionaries ADD COLUMN catalog_count INTEGER DEFAULT 0;")
+        if "metadata_json" not in dict_cols:
+            conn.execute("ALTER TABLE classifier_dictionaries ADD COLUMN metadata_json TEXT;")
+
+        # brand_flavors columns
+        cursor.execute("PRAGMA table_info(brand_flavors);")
+        brand_cols = [row[1] for row in cursor.fetchall()]
+        if "catalog_count" not in brand_cols:
+            conn.execute("ALTER TABLE brand_flavors ADD COLUMN catalog_count INTEGER DEFAULT 0;")
+
+        # bt_gk_map columns
+        cursor.execute("PRAGMA table_info(bt_gk_map);")
+        map_cols = [row[1] for row in cursor.fetchall()]
+        if "gk_count" not in map_cols:
+            conn.execute("ALTER TABLE bt_gk_map ADD COLUMN gk_count INTEGER DEFAULT 0;")
+        if "catalog_count" not in map_cols:
+            conn.execute("ALTER TABLE bt_gk_map ADD COLUMN catalog_count INTEGER DEFAULT 0;")
+
+        # Ensure performance indexes for dictionary catalog counts
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_classifier_dict_lookup ON classifier_dictionaries(domain, tag_type, catalog_count DESC);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_brand_flavors_count ON brand_flavors(domain, catalog_count DESC);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_bt_gk_map_count ON bt_gk_map(domain, catalog_count DESC);")
 
         conn.commit()
     except Exception as e:

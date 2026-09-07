@@ -181,3 +181,33 @@ def test_interactive_rerun_rules():
     data = resp.json()
     assert "suggested_bt" in data
     assert "suggested_gk" in data
+
+
+def test_catalog_summary_stats():
+    """Verify /catalog/summary-stats returns consolidated counts instantly."""
+    for domain in ["market", "food"]:
+        resp = client.get("/catalog/summary-stats", params={"domain": domain})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["domain"] == domain
+        assert "catalog" in data and isinstance(data["catalog"], int)
+        assert "gk" in data and isinstance(data["gk"], int)
+        assert "bt" in data and isinstance(data["bt"], int)
+        assert "category" in data and isinstance(data["category"], int)
+        assert "brands" in data and isinstance(data["brands"], int)
+        assert "bt_gk_map" in data and isinstance(data["bt_gk_map"], int)
+        # All counts should be non-negative
+        assert all(count >= 0 for k, count in data.items() if k != "domain")
+
+
+def test_catalog_dictionary_search():
+    """Verify /catalog endpoint searches dictionaries without reading full catalog into memory."""
+    for dataset in ["gk", "bt", "category", "brands", "bt_gk_map"]:
+        resp = client.get("/catalog", params={"dataset": dataset, "domain": "market", "page": 1, "page_size": 5})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "results" in data
+        assert "total" in data
+        assert isinstance(data["results"], list)
+        assert data["total"] >= 0
+

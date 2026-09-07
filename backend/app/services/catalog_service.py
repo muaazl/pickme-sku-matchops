@@ -255,7 +255,15 @@ def _bg_build_cache():
         _catalog_records_cache.clear()
         for domain in ("market", "food"):
             logger.info(f"Rebuilding Feather cache for {domain}...")
-            DataIngestion.load_catalog(engine_config.GOOGLE_SHEET_ID, domain=domain, force_fetch=True)
+            cat_df, _ = DataIngestion.load_catalog(engine_config.GOOGLE_SHEET_ID, domain=domain, force_fetch=True)
+            try:
+                DataIngestion.load_classifier_dictionaries(engine_config.GOOGLE_SHEET_ID, domain=domain, force_fetch=True)
+                DataIngestion.load_bt_gk_map_from_sheets(engine_config.GOOGLE_SHEET_ID, domain=domain, force_fetch=True)
+                DataIngestion.compute_and_store_dictionary_counts(domain, cat_df=cat_df)
+                from engine.data_pipeline.meilisearch_sync import sync_dictionaries_to_meili
+                sync_dictionaries_to_meili(domain)
+            except Exception as dict_err:
+                logger.warning(f"Could not refresh dictionaries for {domain} in background build: {dict_err}")
             
         from backend.app.services.engine_client import reload_engine_models
         logger.info("Notifying ML Engine to reload models and rebuild pipelines...")

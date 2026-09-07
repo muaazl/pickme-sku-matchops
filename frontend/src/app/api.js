@@ -122,6 +122,7 @@ export const testRule = async ({ rule, sampleRecord }) =>
 
 // Catalog
 export const searchCatalog = async (params) => (await api.get('/catalog', { params })).data;
+export const getCatalogSummaryStats = async (params) => (await api.get('/catalog/summary-stats', { params })).data;
 export const refreshCatalog = async () => (await api.post('/catalog/refresh')).data;
 export const buildCatalogCache = async () => (await api.post('/catalog/build-cache')).data;
 export const checkCatalogSync = async (params) => (await api.get('/catalog/check-sync', { params })).data;
