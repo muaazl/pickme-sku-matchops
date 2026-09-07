@@ -41,7 +41,7 @@ class EmbeddingEngine:
             # Auto-export if missing
             if not os.path.exists(config.BI_ENCODER_ONNX):
                 try:
-                    from engine.export_onnx import export_bge_m3
+                    from engine.scripts.export_onnx import export_bge_m3
                     logger.info("[EMBED] BGE-M3 ONNX not found. Initiating on-demand export...")
                     export_bge_m3()
                 except Exception as exp_err:
@@ -76,7 +76,7 @@ class EmbeddingEngine:
             # Auto-export if missing
             if not os.path.exists(config.CROSS_ENCODER_ONNX):
                 try:
-                    from engine.export_onnx import export_bge_reranker
+                    from engine.scripts.export_onnx import export_bge_reranker
                     logger.info("[EMBED] BGE-Reranker ONNX not found. Initiating on-demand export...")
                     export_bge_reranker()
                 except Exception as exp_err:

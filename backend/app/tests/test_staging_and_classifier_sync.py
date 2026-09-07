@@ -134,10 +134,10 @@ class TestStagingAndClassifierSync(unittest.TestCase):
         self.assertTrue(len(hashes["market_training_state"]) > 0)
         self.assertTrue(clf._trained)
 
-    @patch("scripts.sync_catalog.DataIngestion.load_catalog")
-    @patch("scripts.sync_catalog.DataIngestion.load_classifier_dictionaries")
+    @patch("engine.scripts.sync_catalog.DataIngestion.load_catalog")
+    @patch("engine.scripts.sync_catalog.DataIngestion.load_classifier_dictionaries")
     def test_rebuild_disk_caches_safe_token_count(self, mock_load_dicts, mock_load_cat):
-        from scripts.sync_catalog import rebuild_disk_caches
+        from engine.scripts.sync_catalog import rebuild_disk_caches
         
         # Test catalog with None/float/missing clean_text
         sample_df = pd.DataFrame({

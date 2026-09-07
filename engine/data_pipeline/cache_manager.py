@@ -152,7 +152,7 @@ class CacheManager:
             if not check_for_updates and not force_sync:
                 raise RuntimeError(
                     f"[CATALOG SYNC ERROR] Catalog metadata cache for domain '{domain.upper()}' was not found at '{processed_df_path}'. "
-                    f"Please run 'python -m backend.sync_catalog --cache' to rebuild disk caches (or 'python -m backend.sync_catalog' for a full sync), then start the server."
+                    f"Please run 'python -m engine.scripts.sync_catalog --cache' to rebuild disk caches (or 'python -m engine.scripts.sync_catalog' for a full sync), then start the server."
                 )
         else:
             try:

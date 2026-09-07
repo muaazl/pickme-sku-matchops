@@ -10,8 +10,11 @@ import pyarrow.feather as feather
 import pandas as pd
 
 # Set up paths so we can import from backend and engine
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(BASE_DIR)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ENGINE_DIR = os.path.dirname(SCRIPT_DIR)
+REPO_ROOT = os.path.dirname(ENGINE_DIR)
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 if sys.platform == "win32":
     if hasattr(sys.stdout, "reconfigure"):
@@ -230,7 +233,7 @@ def run_sync(
             if do_qdrant:
                 logger.info(f"[{domain.upper()}] Step 3: Training classifiers & Syncing Qdrant vectors...")
                 try:
-                    from engine.export_onnx import export_all_models_if_needed
+                    from engine.scripts.export_onnx import export_all_models_if_needed
                     export_all_models_if_needed()
                 except Exception as exp_err:
                     logger.warning(f"ONNX export verification check: {exp_err}")

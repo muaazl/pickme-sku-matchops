@@ -85,12 +85,12 @@ def main():
             print("[SETUP] Required models are missing. Initiating one-time download, ONNX export & INT8 quantization...", flush=True)
             env = os.environ.copy()
             env["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
-            subprocess.run([sys.executable, "engine/export_onnx.py"], check=True, env=env)
+            subprocess.run([sys.executable, "engine/scripts/export_onnx.py"], check=True, env=env)
             print("[SETUP] Models exported and quantized successfully!", flush=True)
 
         if needs_quantization and use_int8 and (not os.path.exists(bge_int8) or not os.path.exists(rerank_int8)):
             print("[SETUP] Running INT8 dynamic quantization for memory optimization...", flush=True)
-            subprocess.run([sys.executable, "engine/quantize_models.py"], check=True)
+            subprocess.run([sys.executable, "engine/scripts/quantize_models.py"], check=True)
             print("[SETUP] INT8 quantization complete!", flush=True)
 
         if not needs_export and not needs_quantization:

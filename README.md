@@ -81,7 +81,7 @@ docker compose up -d
 ### 3. Ingest Demo Sample Data (Instant Offline Mode)
 To seed the catalog, train classifiers, and vectorize embeddings immediately from the pre-packaged sample dataset:
 ```bash
-docker compose exec engine python -m engine.sync_catalog --sample
+docker compose exec engine python -m engine.scripts.sync_catalog --sample
 ```
 *(Optional: Run `docker compose restart backend` to immediately refresh backend memory caches with the seeded catalog).*
 
@@ -101,7 +101,7 @@ SKU MatchOps supports two flexible modes of catalog ingestion:
 The repository includes a ready-to-run demo dataset at [`data/sample/SampleData.xlsx`](data/sample/SampleData.xlsx) containing 500 Food dishes, 500 Market retail products, and taxonomy dictionaries.
 To reset and load this sample data into the system:
 ```bash
-docker compose exec engine python -m engine.sync_catalog --sample
+docker compose exec engine python -m engine.scripts.sync_catalog --sample
 ```
 
 ### Option B: Live Google Sheets Integration
@@ -119,9 +119,9 @@ You can connect your own Google Sheet catalog by following these steps:
 4. **Trigger Sync**:
    - Run the catalog sync command to fetch from Google Sheets, index into Meilisearch, vectorize embeddings into Qdrant, and train classifiers:
      ```bash
-     docker compose exec engine python -m engine.sync_catalog
+     docker compose exec engine python -m engine.scripts.sync_catalog
      ```
-     *(Or locally outside Docker: `python -m engine.sync_catalog`)*
+     *(Or locally outside Docker: `python -m engine.scripts.sync_catalog`)*
 
 ### Google Sheet Tab Schema
 
@@ -166,7 +166,7 @@ pip install -r backend/requirements.txt
 pip install -r engine/requirements.txt
 
 # Ingest sample catalog data & prepare ONNX models
-python -m engine.sync_catalog --sample
+python -m engine.scripts.sync_catalog --sample
 ```
 
 ### 3. Run Microservices

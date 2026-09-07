@@ -9,9 +9,14 @@ import torch.nn as nn
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("export_onnx")
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ONNX_DIR = os.path.join(BASE_DIR, "onnx_models")
-TMP_DIR = os.path.join(BASE_DIR, "onnx_tmp")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ENGINE_DIR = os.path.dirname(SCRIPT_DIR)
+PROJECT_ROOT = os.path.dirname(ENGINE_DIR)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+ONNX_DIR = os.path.join(ENGINE_DIR, "onnx_models")
+TMP_DIR = os.path.join(ENGINE_DIR, "onnx_tmp")
 
 def ensure_dirs():
     os.makedirs(ONNX_DIR, exist_ok=True)
@@ -205,7 +210,7 @@ def export_all_models_if_needed(force: bool = False, quantize: bool = True):
         try:
             import subprocess
             logger.info("Triggering INT8 dynamic quantization in a dedicated isolated process...")
-            subprocess.run([sys.executable, os.path.join(BASE_DIR, "quantize_models.py")], check=True)
+            subprocess.run([sys.executable, os.path.join(SCRIPT_DIR, "quantize_models.py")], check=True)
         except Exception as e:
             logger.warning(f"INT8 dynamic quantization step encountered an issue: {e}")
 

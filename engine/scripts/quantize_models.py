@@ -10,8 +10,11 @@ from transformers import AutoTokenizer
 
 # Resolve ONNX models directory dynamically
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
-ONNX_DIR = os.path.join(PROJECT_ROOT, "engine", "onnx_models")
+ENGINE_DIR = os.path.dirname(SCRIPT_DIR)
+PROJECT_ROOT = os.path.dirname(ENGINE_DIR)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+ONNX_DIR = os.path.join(ENGINE_DIR, "onnx_models")
 
 def quantize_model(input_path: str, output_path: str, model_name: str):
     if not os.path.exists(input_path):

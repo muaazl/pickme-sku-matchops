@@ -71,7 +71,7 @@ class NEREngine:
         
         # 2. Try downloading ONNX model on demand if missing
         try:
-            from engine.export_onnx import export_gliner
+            from engine.scripts.export_onnx import export_gliner
             logger.info("[NER] GLiNER ONNX model not found locally. Downloading ONNX model...")
             export_gliner()
             self.model = GLiNER.from_pretrained(
