@@ -220,8 +220,38 @@ def build_umbrella_from_training(cat_df: pd.DataFrame, threshold: float = 0.60) 
         logger.error(f"build_umbrella_from_training failed: {e}")
         return {}
 
+PRIMARY_DISH_TYPES = [
+    "fried rice", "chop suey rice", "chop suey noodles", "chop suey",
+    "biriyani", "kottu", "rice and curry", "nasi goreng", "noodles",
+    "fried noodles", "pasta", "burger", "pizza", "submarine", "wrap", "taco", "soup"
+]
+
+def is_conflicting_dish_tag(tag: str, bt: str) -> bool:
+    """Checks if a generic keyword tag represents a conflicting primary dish type for the given BT."""
+    tag_lower = str(tag or "").lower().strip()
+    bt_lower = str(bt or "").lower().strip()
+    if not bt_lower or not tag_lower:
+        return False
+    # If the tag directly matches or ends with the current BT, it's valid (e.g. 'fish fried rice' for 'fried rice')
+    if tag_lower == bt_lower or tag_lower.endswith(bt_lower):
+        return False
+    # Find which primary dish type this BT belongs to
+    curr_dish = None
+    for d in PRIMARY_DISH_TYPES:
+        if bt_lower == d or bt_lower.endswith(d):
+            curr_dish = d
+            break
+    if not curr_dish:
+        return False
+    # Check if tag is or ends with another distinct primary dish
+    for other_dish in PRIMARY_DISH_TYPES:
+        if other_dish != curr_dish and not bt_lower.endswith(other_dish):
+            if tag_lower == other_dish or tag_lower.endswith(" " + other_dish):
+                return True
+    return False
+
 def augment_bt_gk_map_with_training(cat_df: pd.DataFrame, bt_gk_map: Dict[str, List[str]], gk_dict_list: List[str]) -> Dict[str, List[str]]:
-    """Augments the BT->GK map using co-occurrences found in the catalog."""
+    """Augments the BT->GK map using co-occurrences found in the catalog, filtering conflicting dish types."""
     if cat_df.empty:
         return bt_gk_map
 
@@ -240,6 +270,7 @@ def augment_bt_gk_map_with_training(cat_df: pd.DataFrame, bt_gk_map: Dict[str, L
             if not bt_stripped:
                 continue
 
+            bt_lower = bt_stripped.lower()
             current_kws_lower = {kw.lower() for kw in augmented.get(bt_stripped, [])}
             current_list = augmented.setdefault(bt_stripped, [])
 
@@ -249,6 +280,8 @@ def augment_bt_gk_map_with_training(cat_df: pd.DataFrame, bt_gk_map: Dict[str, L
                     if not tag_stripped:
                         continue
                     tag_lower = tag_stripped.lower()
+                    if is_conflicting_dish_tag(tag_lower, bt_lower):
+                        continue
                     if tag_lower in gk_set and tag_lower not in current_kws_lower:
                         current_list.append(gk_set[tag_lower])
                         current_kws_lower.add(tag_lower)

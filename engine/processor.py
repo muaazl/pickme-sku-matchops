@@ -17,6 +17,7 @@ from engine.resource_loader import (
     _get_vector_store,
     get_pipeline,
     get_classifier,
+    get_ner_engine,
     check_models_loaded,
 )
 from engine.template_suggest import suggest_tags_from_template
@@ -117,6 +118,7 @@ def process_request(
     task = task.lower()
     domain = domain or "market"
     check_models_loaded(domain, task)
+    skus = [s.copy() for s in skus]
 
     def check_cancel():
         if is_cancelled and is_cancelled():
@@ -131,7 +133,8 @@ def process_request(
 
     # Food domain flavor entity enrichment
     if domain == config.DOMAIN_FOOD:
-        embed_engine, ner_engine = _get_shared_models()
+        embed_engine, _ = _get_shared_models()
+        ner_engine = get_ner_engine(domain)
         if ner_engine:
             sku_texts = [
                 f"{sku.get('name', '')} {sku.get('description', '')} {sku.get('category', '')}".strip()
@@ -141,13 +144,19 @@ def process_request(
             for i, sku in enumerate(skus):
                 flavor_set = ner_results[i].get("flavor", set())
                 name = sku.get("name", "")
-                if any(f in getattr(ner_engine, 'vegetable_flavors', set()) for f in flavor_set):
-                    name += " veg"
-                if any(f in getattr(ner_engine, 'seafood_flavors', set()) for f in flavor_set):
-                    name += " seafood"
-                meat_count = sum(1 for f in flavor_set if f in getattr(ner_engine, 'meat_flavors', set()) and f != "egg")
-                if meat_count >= 2:
+                seafood_set = getattr(ner_engine, 'seafood_flavors', set())
+                meat_set = getattr(ner_engine, 'meat_flavors', set())
+                veg_set = getattr(ner_engine, 'vegetable_flavors', set())
+                has_seafood = any(f in seafood_set for f in flavor_set)
+                land_meats = [f for f in flavor_set if f in meat_set and f not in seafood_set and f != "egg"]
+                meat_count = len(land_meats)
+                has_meat = meat_count > 0
+                has_veg = any(f in veg_set for f in flavor_set)
+
+                if (has_meat and has_seafood) or meat_count >= 2:
                     name += " mixed"
+                elif not has_seafood and not has_meat and has_veg:
+                    name += " veg"
                 sku["name"] = name
 
     if task == "matcher":
@@ -207,7 +216,8 @@ def process_request(
     elif task == "classifier":
         emit_progress("embedding", 5.0)
         classifier = get_classifier(domain)
-        embed_engine, ner_engine = _get_shared_models()
+        embed_engine, _ = _get_shared_models()
+        ner_engine = getattr(classifier, 'ner_engine', None) or get_ner_engine(domain)
         vector_store = _get_vector_store()
         reranker = RerankerWrapper(embed_engine) if (hasattr(embed_engine, 'cross_session') and embed_engine.cross_session) else None
 
@@ -279,6 +289,34 @@ def process_request(
 
         emit_progress("writing_results", 95.0)
         _apply_template_tag_enrichment(skus, out, domain, mode="classifier")
+
+        emit_progress("applying_rules", 96.0)
+        for j, row in enumerate(out):
+            check_cancel()
+            sku = skus[j]
+            record = {
+                "sku_name": sku.get("name", ""),
+                "domain": domain,
+                "bt": row.get("suggested_bt", ""),
+                "gk": [x.strip() for x in str(row.get("suggested_gk", "")).split(",") if x.strip()],
+                "region": row.get("suggested_region") if domain == config.DOMAIN_FOOD else None,
+                "category": row.get("suggested_region") if domain == config.DOMAIN_MARKET else None,
+                "price": sku.get("price", 0.0),
+                "confidence": row.get("bt_confidence", 0.0) or 0.0,
+                "match_source": "classifier",
+                "matched_sku": "",
+                "reasoning": row.get("logic_notes", "")
+            }
+
+            aug_record = run_rules_engine(record)
+
+            row["suggested_bt"] = str(aug_record.get("bt") or "")
+            row["suggested_gk"] = ", ".join(aug_record.get("gk", []))
+            row["suggested_region"] = str(aug_record.get("region") or "") if domain == config.DOMAIN_FOOD else str(aug_record.get("category") or "")
+
+            applied = aug_record.get("rules_applied", [])
+            row["rules_applied"] = json.dumps(applied) if applied else ""
+
         emit_progress("done", 100.0, 0)
         return {"domain": domain, "total": len(out), "results": out}
 
@@ -348,7 +386,8 @@ def process_request(
         if escalate_indices:
             emit_progress("classifying", 70.0)
             classifier = get_classifier(domain)
-            embed_engine, ner_engine = _get_shared_models()
+            embed_engine, _ = _get_shared_models()
+            ner_engine = getattr(classifier, 'ner_engine', None) or get_ner_engine(domain)
             vector_store = _get_vector_store()
             reranker = RerankerWrapper(embed_engine) if (hasattr(embed_engine, 'cross_session') and embed_engine.cross_session) else None
 

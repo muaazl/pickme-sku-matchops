@@ -29,6 +29,7 @@ logger = logging.getLogger("matchops.engine.loader")
 # Lazy pipeline cache
 _pipelines: dict[str, SKUMatcher] = {}
 _classifiers: dict[str, ZeroShotClassifier] = {}
+_domain_ner_engines: dict[str, NEREngine] = {}
 _vector_store = None
 _loader_lock = threading.RLock()
 
@@ -111,6 +112,7 @@ def get_pipeline(domain: str) -> SKUMatcher:
 
         with _loader_lock:
             _pipelines[domain] = matcher
+            _domain_ner_engines[domain] = ner_engine
             _model_statuses[domain]["pipeline"] = "ready"
         logger.info(f"[{domain.upper()}] Pipeline ready.")
         sys.stdout.flush()
@@ -177,6 +179,7 @@ def get_classifier(domain: str) -> ZeroShotClassifier:
 
         with _loader_lock:
             _classifiers[domain] = classifier
+            _domain_ner_engines[domain] = ner_engine
             _model_statuses[domain]["classifier"] = "ready"
         logger.info(f"[{domain.upper()}] Classifier ready.")
         sys.stdout.flush()
@@ -185,6 +188,35 @@ def get_classifier(domain: str) -> ZeroShotClassifier:
         with _loader_lock:
             _model_statuses[domain]["classifier"] = f"failed: {str(e)}"
         raise e
+
+
+def get_ner_engine(domain: str) -> NEREngine:
+    """Returns a domain-specific NEREngine with the domain's dictionary loaded."""
+    if domain not in (config.DOMAIN_MARKET, config.DOMAIN_FOOD):
+        domain = config.DOMAIN_MARKET
+
+    with _loader_lock:
+        if domain in _domain_ner_engines:
+            return _domain_ner_engines[domain]
+        if domain in _pipelines and hasattr(_pipelines[domain], "ner") and _pipelines[domain].ner is not None:
+            _domain_ner_engines[domain] = _pipelines[domain].ner
+            return _domain_ner_engines[domain]
+        if domain in _classifiers and hasattr(_classifiers[domain], "ner_engine") and _classifiers[domain].ner_engine is not None:
+            _domain_ner_engines[domain] = _classifiers[domain].ner_engine
+            return _domain_ner_engines[domain]
+
+    # Build domain NEREngine reusing shared ONNX model
+    _, ner_engine_shared = _get_shared_models()
+    try:
+        _, brands_df = DataIngestion.load_catalog(config.GOOGLE_SHEET_ID, domain=domain)
+    except Exception as e:
+        logger.warning(f"Could not load catalog for domain '{domain}' NER: {e}")
+        brands_df = pd.DataFrame(columns=["Flavor Name", "Brand Name", "Aliases", "Is_Weak"])
+
+    domain_ner = NEREngine(brands_df, domain=domain, shared_model=ner_engine_shared.model)
+    with _loader_lock:
+        _domain_ner_engines[domain] = domain_ner
+    return domain_ner
 
 
 def check_models_loaded(domain: str, task: str) -> None:

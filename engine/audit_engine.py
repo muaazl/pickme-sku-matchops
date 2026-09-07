@@ -76,30 +76,48 @@ def run_sku_audit(
         full_ner_input += f" {category}"
         
     ner_text = TextPipeline.prep_for_ner(full_ner_input)
-    extracted_entities = pipeline.ner.extract_entities(ner_text) if pipeline and hasattr(pipeline, "ner") else {}
-    
-    # Food domain flavor suffix modification (System pipeline step in processor.py)
-    if domain == config.DOMAIN_FOOD:
-        ner_engine = getattr(pipeline, "ner", None)
-        if ner_engine is None:
+    ner_engine = getattr(pipeline, "ner", None) if pipeline else None
+    if ner_engine is None and classifier and hasattr(classifier, "ner_engine") and classifier.ner_engine:
+        ner_engine = classifier.ner_engine
+    if ner_engine is None:
+        try:
+            from engine.resource_loader import get_ner_engine
+            ner_engine = get_ner_engine(domain)
+        except Exception:
             try:
                 from engine.resource_loader import _get_shared_models
                 _, ner_engine = _get_shared_models()
             except Exception:
                 ner_engine = None
-        if ner_engine:
-            flavor_set = extracted_entities.get("flavor", set())
-            suffixes = []
-            if any(f in getattr(ner_engine, 'vegetable_flavors', set()) for f in flavor_set):
-                suffixes.append("veg")
-            if any(f in getattr(ner_engine, 'seafood_flavors', set()) for f in flavor_set):
-                suffixes.append("seafood")
-            meat_count = sum(1 for f in flavor_set if f in getattr(ner_engine, 'meat_flavors', set()) and f != "egg")
-            if meat_count >= 2:
-                suffixes.append("mixed")
-            if suffixes:
-                food_suffix_added = " ".join(suffixes)
-                effective_sku_name = f"{sku_name} {food_suffix_added}"
+
+    extracted_entities = ner_engine.extract_entities(ner_text) if ner_engine and hasattr(ner_engine, "extract_entities") else {}
+    
+    # Food domain flavor suffix modification (System pipeline step in processor.py)
+    if domain == config.DOMAIN_FOOD and ner_engine:
+        flavor_set = extracted_entities.get("flavor", set())
+        seafood_set = getattr(ner_engine, 'seafood_flavors', set())
+        meat_set = getattr(ner_engine, 'meat_flavors', set())
+        veg_set = getattr(ner_engine, 'vegetable_flavors', set())
+        has_seafood = any(f in seafood_set for f in flavor_set)
+        land_meats = [f for f in flavor_set if f in meat_set and f not in seafood_set and f != "egg"]
+        meat_count = len(land_meats)
+        has_meat = meat_count > 0
+        has_veg = any(f in veg_set for f in flavor_set)
+
+        suffixes = []
+        if (has_meat and has_seafood) or meat_count >= 2:
+            suffixes.append("mixed")
+        elif not has_seafood and not has_meat and has_veg:
+            suffixes.append("veg")
+
+        if suffixes:
+            food_suffix_added = " ".join(suffixes)
+            effective_sku_name = f"{sku_name} {food_suffix_added}"
+            clean_input = TextPipeline.normalize_final(TextPipeline.standardize_units(effective_sku_name))
+            input_no_weights = TextPipeline.strip_weights(clean_input)
+            input_w_data = TextPipeline.extract_weight_feature(clean_input)
+            flavor_set.update(suffixes)
+            extracted_entities["flavor"] = flavor_set
 
     audit_data["stage1_nlp"] = {
         "raw_sku": sku_name,
@@ -117,7 +135,7 @@ def run_sku_audit(
 
     # If task is classifier-only, jump to Classifier processing path
     if task == "classifier":
-        _audit_classifier_pipeline(audit_data, domain, sku_name, description, category, price, classifier=classifier)
+        _audit_classifier_pipeline(audit_data, domain, effective_sku_name, description, category, price, classifier=classifier, ner_engine=ner_engine)
         return audit_data
 
     # -------------------------------------------------------------
@@ -343,9 +361,12 @@ def run_sku_audit(
         if df_pool.empty:
             return res_list
         
+        # Deduplicate df_pool by clean_text to prevent repeating the same candidate
+        df_pool_unique = df_pool.drop_duplicates(subset=["clean_text"])
+        
         # Sort pool by raw_cross_score descending to mirror SKUMatcher candidate evaluation ordering
         pool_rows = []
-        for _, cand_row in df_pool.iterrows():
+        for _, cand_row in df_pool_unique.iterrows():
             cand_txt = cand_row["clean_text"]
             matching_rows = candidates[candidates["clean_text"] == cand_txt]
             raw_score = float(matching_rows.iloc[0]["raw_cross_score"]) if not matching_rows.empty else -10.0
@@ -463,7 +484,8 @@ def run_sku_audit(
         winner = best_res["cand_row"]
         win_score = best_res["computed_score"]
         win_status = best_res["status"]
-        win_reasons = best_res["reasons"]
+        if not win_reasons:
+            win_reasons = best_res["reasons"]
     else:
         winner = candidates.iloc[0]
         win_score = 0.0
@@ -521,7 +543,21 @@ def run_sku_audit(
                     filtered_kws.append(kw)
             winner_gk = ", ".join(filtered_kws)
 
-    region_val = str(winner.get("Region", winner.get("Categories", "")))
+    def _clean_val(row, key):
+        if key not in row: return None
+        v = row[key]
+        if pd.isna(v): return None
+        s = str(v).strip()
+        return s if s else None
+
+    region_val = (
+        _clean_val(winner, "region")
+        or _clean_val(winner, "Region")
+        or _clean_val(winner, "category")
+        or _clean_val(winner, "Category")
+        or _clean_val(winner, "Categories")
+        or ""
+    )
     
     audit_data["stage5_matcher_result"] = {
         "matched_catalog_name": str(winner["Name"]),
@@ -566,13 +602,17 @@ def run_sku_audit(
         if classifier:
             try:
                 from engine.classification.tagger import tag_all_skus
-                query_embeddings = [{"dense": input_vec_dense, "sparse": input_vec_sparse}]
+                esc_embs = pipeline.embedder.embed_weighted_sku(
+                    [effective_sku_name], [description], [category],
+                    weights=config.CLASSIFIER_WEIGHTS
+                )
+                query_embeddings = [{"dense": esc_embs["dense"][0], "sparse": esc_embs["sparse"][0]}]
                 class RerankerWrapper:
                     def predict(self, pairs): return pipeline.embedder.score_cross_encoder(pairs)
                 reranker = RerankerWrapper() if (hasattr(pipeline.embedder, 'cross_session') and pipeline.embedder.cross_session) else None
 
                 clf_results = tag_all_skus(
-                    sku_names=[sku_name],
+                    sku_names=[effective_sku_name],
                     sku_categories=[category],
                     query_embeddings=query_embeddings,
                     vector_store=pipeline.vector_store,
@@ -689,7 +729,7 @@ def run_sku_audit(
     rules_confidence = max(win_score, clf_conf, 0.95 if template_applied else 0.0)
 
     record = {
-        "sku_name": sku_name,
+        "sku_name": effective_sku_name,
         "domain": domain,
         "bt": curr_bt,
         "gk": gk_list,
@@ -743,14 +783,23 @@ def _audit_classifier_pipeline(audit_data: dict, domain: str, sku_name: str, des
         except Exception:
             classifier = None
             
-    if embed_engine is None or ner_engine is None:
+    if embed_engine is None:
         try:
             from engine.resource_loader import _get_shared_models
-            e_mod, n_mod = _get_shared_models()
-            embed_engine = embed_engine or e_mod
-            ner_engine = ner_engine or n_mod
+            e_mod, _ = _get_shared_models()
+            embed_engine = e_mod
         except Exception:
             pass
+
+    if ner_engine is None:
+        if classifier and hasattr(classifier, "ner_engine") and classifier.ner_engine:
+            ner_engine = classifier.ner_engine
+        else:
+            try:
+                from engine.resource_loader import get_ner_engine
+                ner_engine = get_ner_engine(domain)
+            except Exception:
+                pass
             
     if vector_store is None:
         try:
@@ -960,7 +1009,7 @@ def _audit_classifier_pipeline(audit_data: dict, domain: str, sku_name: str, des
     synth_added = len(top_candidates) - synth_before
 
     # Strategy: GK Flavor Leak & Conflict Filters
-    ner_engine_clf = getattr(classifier, "ner_engine", ner_engine)
+    ner_engine_clf = ner_engine or getattr(classifier, "ner_engine", None)
     guaranteed_clean, trained_gk_clean, top_candidates_clean = strategy.apply_flavor_leak_filters(
         list(guaranteed), list(trained_gk), list(top_candidates), extracted_flavors, ner_engine_clf
     )
