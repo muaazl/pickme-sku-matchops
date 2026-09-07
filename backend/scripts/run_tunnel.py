@@ -34,7 +34,7 @@ def find_or_download_cloudflared() -> str:
 
     # 2. Check local workspace directory
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    root_dir = os.path.dirname(current_dir)
+    root_dir = os.path.dirname(os.path.dirname(current_dir))
     is_windows = platform.system().lower() == "windows"
     binary_name = "cloudflared.exe" if is_windows else "cloudflared"
     

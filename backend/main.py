@@ -15,7 +15,7 @@ from backend.app.api.routes import api_router
 from backend.app.middleware.audit_logging import AuditLoggingMiddleware
 from backend.app.middleware.etag import ETagMiddleware
 from backend.app.services.meilisearch_service import check_and_sync_meilisearch
-from backend.migrate_db import migrate
+from backend.scripts.migrate_db import migrate
 from engine import config
 from engine.rules_engine import refresh_rules_cache
 
