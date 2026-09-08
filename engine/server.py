@@ -45,12 +45,19 @@ app = FastAPI(
     version="2.0.0"
 )
 
+# The engine is an internal service: only the backend gateway calls it
+# (server-to-server). Restrict CORS to the backend origin rather than "*".
+_engine_cors_origins = [
+    o.strip()
+    for o in os.getenv("BACKEND_URL", "http://backend:8000").split(",")
+    if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_engine_cors_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
 )
 
 _model_load_lock = threading.Lock()
