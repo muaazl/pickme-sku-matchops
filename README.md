@@ -78,6 +78,18 @@ cp .env.example .env
 docker compose up -d
 ```
 
+> [!NOTE]
+> **Development vs. hardened networking.** `docker compose up` also loads
+> `docker-compose.override.yml`, which publishes the internal service ports
+> (Qdrant `6333/6334`, Meilisearch `7700`, engine `8001`) to the host for local
+> debugging. For an exposure-hardened deployment, skip the override so that only
+> the backend (`8000`) and frontend (`5173`) are reachable from the host:
+> ```bash
+> docker compose -f docker-compose.yml up -d
+> ```
+> The services still reach each other over the private compose network; use
+> `docker compose exec <service> …` to inspect the internal ones.
+
 ### 3. Ingest Demo Sample Data (Instant Offline Mode)
 To seed the catalog, train classifiers, and vectorize embeddings immediately from the pre-packaged sample dataset:
 ```bash
@@ -88,8 +100,8 @@ docker compose exec engine python -m engine.scripts.sync_catalog --sample
 ### 4. Access Services
 - **Web Dashboard**: [http://localhost:5173](http://localhost:5173)
 - **Backend API Docs (Swagger UI)**: [http://localhost:8000/docs](http://localhost:8000/docs)
-- **ML Engine API Docs**: [http://localhost:8001/docs](http://localhost:8001/docs)
-- **Qdrant Web Dashboard**: [http://localhost:6333/dashboard](http://localhost:6333/dashboard)
+- **ML Engine API Docs**: [http://localhost:8001/docs](http://localhost:8001/docs) *(dev mode only)*
+- **Qdrant Web Dashboard**: [http://localhost:6333/dashboard](http://localhost:6333/dashboard) *(dev mode only)*
 
 ---
 
