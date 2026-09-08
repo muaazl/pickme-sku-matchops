@@ -1,0 +1,50 @@
+# Build context excludes for Dockerfile.backend / Dockerfile.engine (context: .)
+# These images COPY ./backend, ./engine and the entrypoint scripts — nothing else.
+
+# VCS / IDE
+.git
+.gitignore
+.gitattributes
+.vscode/
+.idea/
+
+# Secrets & local env (images receive config via env_file at runtime)
+.env
+.env.*
+!.env.example
+
+# Python virtualenvs / caches
+venv/
+.venv/
+env/
+ENV/
+**/__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Frontend (not part of the backend/engine images)
+frontend/
+
+# Runtime data, logs and DBs (mounted as volumes at runtime)
+data/
+*.log
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+
+# Engine caches, model weights and vector store (mounted / regenerated at runtime)
+engine/cache/
+engine/qdrant_data/
+engine/onnx_models/
+
+# Tunnel binary (the backend image downloads its own Linux build)
+cloudflared.exe
+*.exe
+
+# Misc
+scratch/
+walkthrough.md
