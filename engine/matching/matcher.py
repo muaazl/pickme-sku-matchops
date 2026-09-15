@@ -17,7 +17,7 @@ logger = logging.getLogger("matchops.matcher")
 class SKUMatcher:
     """Main SKU matching pipeline orchestrator."""
 
-    def __init__(self, catalog_df: pd.DataFrame, brands_df: pd.DataFrame, ner_engine, embed_engine, cache_manager, logic_gates, domain: str = config.DOMAIN_MARKET, classifier=None):
+    def __init__(self, catalog_df: pd.DataFrame, brands_df: pd.DataFrame, ner_engine, embed_engine, cache_manager, logic_gates, domain: str = config.DOMAIN_MARKET, classifier=None, check_for_updates: bool = False, force_sync: bool = False):
         self.ner = ner_engine
         self.embedder = embed_engine
         self.rules = logic_gates
@@ -81,7 +81,9 @@ class SKUMatcher:
             self._specific_flavor_pattern = None
 
         # Sync catalog with cache and vector store
-        self.raw_catalog, self.vector_store = cache_manager.manage_catalog_cache(catalog_df, brands_df, domain=domain)
+        self.raw_catalog, self.vector_store = cache_manager.manage_catalog_cache(
+            catalog_df, brands_df, domain=domain, check_for_updates=check_for_updates, force_sync=force_sync
+        )
         self.raw_catalog = self.raw_catalog.reset_index(drop=True)
 
         # Build lookup maps for fast O(1) exact matching and O(1) token-sort fuzzy bypass
@@ -181,7 +183,7 @@ class SKUMatcher:
             # Exact text match lookup
             cat_idx = self.exact_match_map.get(clean_input)
             if cat_idx is not None:
-                bypass_results[i] = (self.raw_catalog.iloc[cat_idx], 100.0, "High Confidence", "Exact Text Match")
+                bypass_results[i] = (self.raw_catalog.iloc[cat_idx], 1.0, "High Confidence", "Exact Text Match")
                 continue
 
             # Early fuzzy search on weight-stripped text (O(1) Hash Map Optimization)
@@ -194,7 +196,7 @@ class SKUMatcher:
 
                 selected_idx = cand_indices[0]
                 weight_reason = ""
-                combined_score = 100.0
+                combined_score = 1.0
 
                 if input_w_data[0] is not None:
                     in_val, _, in_type = input_w_data
@@ -429,6 +431,11 @@ class SKUMatcher:
             if progress_callback:
                 progress_callback(75.0 + (((i + 1) / len(raw_names)) * 25.0), f"Matching {i + 1} of {len(raw_names)}...")
 
+            best_match_row_fallback = None
+            final_score_fallback = -10.0
+            status_fallback = "Rejected"
+            reasons_fallback = ""
+
             raw_input, clean_input, input_no_weights = raw_names[i], clean_inputs[i], input_no_weights_list[i]
             row_data = input_df.iloc[i]
             current_input_price = prices[i]
@@ -506,12 +513,21 @@ class SKUMatcher:
                         candidates_unfiltered = candidates_unfiltered.drop_duplicates(subset=["clean_text"])
                     
                     if candidates_unfiltered.empty:
-                        if 'best_match_row_fallback' in locals():
+                        if best_match_row_fallback is not None:
                             best_match_row = best_match_row_fallback
                             final_score = final_score_fallback
                             status = status_fallback
                             reasons = reasons_fallback
                         else:
+                            results.append({
+                                "Input Raw": raw_input, "Matched Catalog Name": "",
+                                "Final Score": 0.0, "Status": "Low / Rejected", "Logic Notes": "No candidates found",
+                                "BasicType": "",
+                                "GenericKeywords": "",
+                                "Categories": "",
+                                "Region": "",
+                                "Input Entities": input_entities, "Catalog Entities": {}
+                            })
                             continue
                     else:
                         candidates_unfiltered = score_candidate_df(candidates_unfiltered, i, clean_input, input_entities)
@@ -547,7 +563,7 @@ class SKUMatcher:
                                 reasons_uf = uf_reasons
                                 best_cand_score_uf = cand_score
 
-                        if 'best_match_row_fallback' in locals() and final_score_fallback > final_score_uf:
+                        if best_match_row_fallback is not None and final_score_fallback > final_score_uf:
                             best_match_row = best_match_row_fallback
                             final_score = final_score_fallback
                             status = status_fallback

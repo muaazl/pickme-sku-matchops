@@ -8,6 +8,7 @@ from engine.config import (
     AUTO_THRESHOLD,
     REVIEW_THRESHOLD,
     RERANKER_THRESHOLD,
+    RERANKER_MARGIN,
     TOP_K_RETRIEVAL as TOP_K_FUSED,
 )
 
@@ -359,6 +360,11 @@ def match_gk_hybrid(sku_name, description, query_dense, query_sparse, vector_sto
                 
         scored_candidates.sort(key=lambda x: x[1], reverse=True)
 
+        if scored_candidates:
+            top_score = scored_candidates[0][1]
+            margin_cutoff = max(RERANKER_THRESHOLD, top_score - RERANKER_MARGIN)
+            scored_candidates = [c for c in scored_candidates if c[1] >= margin_cutoff]
+
         reranked_tags = [tag for tag, score in scored_candidates]
         if scored_candidates:
             final_conf = scored_candidates[0][1]
@@ -636,6 +642,10 @@ def tag_all_skus(sku_names, sku_categories, query_embeddings, vector_store, rera
             scored_candidates.sort(key=lambda x: x[1], reverse=True)
 
             if USE_RERANKER and reranker is not None and top_candidates:
+                if scored_candidates:
+                    top_score = scored_candidates[0][1]
+                    margin_cutoff = max(RERANKER_THRESHOLD, top_score - RERANKER_MARGIN)
+                    scored_candidates = [c for c in scored_candidates if c[1] >= margin_cutoff]
                 reranked_tags = [tag for tag, score in scored_candidates]
                 final_conf = scored_candidates[0][1] if scored_candidates else 0.0
             else:
@@ -682,6 +692,14 @@ def tag_all_skus(sku_names, sku_categories, query_embeddings, vector_store, rera
             status_key: get_status(third_tag_conf, bool(third_tag_name), third_tag_source),
             source_key: third_tag_source,
         }
+        gk_str = ", ".join(gk_tags)
+        third_label = "Region" if domain == "food" else "Category"
+        reasoning = (
+            f"Classifier: BT='{bt_tag}' ({bt_source}, {round(bt_conf, 3)}), "
+            f"GK='{gk_str}' ({round(gk_conf, 3)}), "
+            f"{third_label}='{third_tag_name}' ({third_tag_source}, {round(third_tag_conf, 3)})"
+        )
+        res["reasoning"] = reasoning
         results.append(res)
 
     if progress_callback:

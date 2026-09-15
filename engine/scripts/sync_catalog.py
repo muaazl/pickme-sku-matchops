@@ -31,13 +31,15 @@ logging.basicConfig(
 logger = logging.getLogger("matchops.sync_catalog")
 
 from engine import config
-from engine.db import init_db, ensure_db_initialized
+from engine.db import init_db, ensure_db_initialized, clear_db_cache
 from engine.data_pipeline.ingestion import DataIngestion
 from engine.nlp.text_cleaner import TextPipeline
 from engine.resource_loader import get_pipeline, get_classifier, _get_vector_store
 
 def reset_sqlite_tables(domain: str = None):
     """Drops and recreates SQLite catalog tables for a clean fresh import."""
+    # Ensure tables exist so that domain-scoped DELETE won't fail if previously dropped
+    init_db(force=False)
     conn = sqlite3.connect(config.DB_PATH)
     try:
         if domain and domain in (config.DOMAIN_MARKET, config.DOMAIN_FOOD):
@@ -54,12 +56,13 @@ def reset_sqlite_tables(domain: str = None):
             conn.execute("DROP TABLE IF EXISTS bt_gk_map;")
             conn.commit()
             logger.info("Dropped catalog_items, brand_flavors, classifier_dictionaries, and bt_gk_map tables.")
+            clear_db_cache()
     except Exception as e:
         logger.warning(f"Error while resetting SQLite tables: {e}")
     finally:
         conn.close()
 
-    init_db()
+    init_db(force=True)
 
 def wipe_all_caches(domains: list = None):
     """Completely purges all disk caches, trained classifier pickles, and feather files."""
@@ -132,17 +135,21 @@ def sync_qdrant_vectors(domain: str, force_reset: bool = False):
     if force_reset:
         vs = _get_vector_store()
         try:
-            vs.delete_collection(domain)
-            logger.info(f"[{domain.upper()}] Deleted existing Qdrant catalog collection for fresh rebuild.")
+            catalog_col = vs._get_collection_name(domain)
+            tags_col = f"{domain}_tags"
+            for col in [catalog_col, tags_col]:
+                if vs.client.collection_exists(col):
+                    vs.client.delete_collection(col)
+                    logger.info(f"[{domain.upper()}] Deleted existing Qdrant collection '{col}' for fresh rebuild.")
         except Exception as e:
             logger.warning(f"[{domain.upper()}] Could not delete collection: {e}")
 
     # 1. Fit classifier and upsert tag embeddings to Qdrant
-    clf = get_classifier(domain)
+    clf = get_classifier(domain, force_reset=force_reset)
     logger.info(f"[{domain.upper()}] ✓ Classifier trained and tag vectors synced.")
 
     # 2. Build matcher pipeline (embeds catalog items with BGE-M3 Dense + Sparse and upserts to Qdrant)
-    pipe = get_pipeline(domain)
+    pipe = get_pipeline(domain, check_for_updates=True, force_sync=force_reset)
     logger.info(f"[{domain.upper()}] ✓ Match pipeline built and catalog vectors synced to Qdrant.")
 
 def run_sync(
@@ -214,7 +221,7 @@ def run_sync(
                     reset_sqlite_tables(domain)
                     cat_df, _ = DataIngestion.load_catalog(sheet_id, domain=domain, force_fetch=True)
                     DataIngestion.load_classifier_dictionaries(sheet_id, domain=domain, force_fetch=True)
-                    DataIngestion.load_bt_gk_map_from_sheets(sheet_id, domain=domain, force_fetch=True)
+                    DataIngestion.load_bt_gk_map_from_sheets(sheet_id, domain=domain, force_fetch=True, cat_df=cat_df)
                     DataIngestion.compute_and_store_dictionary_counts(domain, cat_df=cat_df)
                     logger.info(f"[{domain.upper()}] ✓ SQLite database successfully populated with dictionary occurrence counts.")
                     

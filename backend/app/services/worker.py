@@ -32,7 +32,8 @@ def enqueue_job(request: BaseRequest, task: str) -> dict:
 
     # 1. Get sequential job ID
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=60.0)
+        conn.execute("PRAGMA busy_timeout=60000;")
         job_id = get_next_job_id(conn)
         conn.close()
     except Exception:
@@ -48,8 +49,9 @@ def enqueue_job(request: BaseRequest, task: str) -> dict:
 
     # 2. Write initial job state to SQLite
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=60.0)
         conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=60000;")
         conn.execute(
             """
             INSERT INTO jobs (
@@ -75,8 +77,9 @@ def enqueue_job(request: BaseRequest, task: str) -> dict:
         logger.error(f"[JOB {job_id}] Dispatch to ML Engine failed: {dispatch_err}")
         # Mark as failed in DB
         try:
-            conn = sqlite3.connect(DB_PATH)
+            conn = sqlite3.connect(DB_PATH, timeout=60.0)
             conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout=60000;")
             conn.execute(
                 "UPDATE jobs SET status = 'failed', current_stage = 'failed', error_message = ? WHERE id = ?",
                 (str(dispatch_err), job_id)
@@ -90,31 +93,5 @@ def enqueue_job(request: BaseRequest, task: str) -> dict:
     return {"job_id": job_id, "status": "queued", "total_skus": len(request.skus)}
 
 
-def log_outbound_request(url: str, method: str, payload: dict, response_status: int, response_text: str, duration_ms: int):
-    """Logs outbound HTTP requests (e.g. Google Sheets webhooks) to SQLite."""
-    try:
-        req_id = str(uuid.uuid4())
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute(
-            """
-            INSERT INTO api_requests (id, method, path, payload_json_redacted, response_json, status_code, duration_ms, ip_address, headers_json, query_params_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                req_id,
-                method,
-                "Google Sheets Callback",
-                json.dumps(payload),
-                response_text,
-                response_status,
-                duration_ms,
-                "outbound",
-                json.dumps({"Content-Type": "application/json"}),
-                json.dumps({"callback_url": url})
-            )
-        )
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.error(f"Failed to log outbound request to DB: {e}")
+from engine.db import log_outbound_request
+

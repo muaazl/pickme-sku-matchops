@@ -80,12 +80,12 @@ def _get_vector_store():
         _vector_store = VectorStore()
     return _vector_store
 
-def get_pipeline(domain: str) -> SKUMatcher:
+def get_pipeline(domain: str, check_for_updates: bool = False, force_sync: bool = False) -> SKUMatcher:
     if domain not in (config.DOMAIN_MARKET, config.DOMAIN_FOOD):
         raise ValueError(f"Unknown domain '{domain}'. Must be 'market' or 'food'.")
 
     with _loader_lock:
-        if domain in _pipelines:
+        if domain in _pipelines and not force_sync and not check_for_updates:
             _model_statuses[domain]["pipeline"] = "ready"
             return _pipelines[domain]
         _model_statuses[domain]["pipeline"] = "loading"
@@ -103,11 +103,13 @@ def get_pipeline(domain: str) -> SKUMatcher:
         logic_gates = LogicGates(embed_engine, brands_df=brands_df)
         cache_manager = CacheManager(ner_engine, embed_engine)
 
-        classifier = get_classifier(domain)
+        classifier = get_classifier(domain, force_reset=force_sync)
         matcher = SKUMatcher(
             cat_df, brands_df, ner_engine, embed_engine,
             cache_manager, logic_gates, domain=domain,
-            classifier=classifier
+            classifier=classifier,
+            check_for_updates=check_for_updates,
+            force_sync=force_sync
         )
 
         with _loader_lock:
@@ -122,12 +124,12 @@ def get_pipeline(domain: str) -> SKUMatcher:
             _model_statuses[domain]["pipeline"] = f"failed: {str(e)}"
         raise e
 
-def get_classifier(domain: str) -> ZeroShotClassifier:
+def get_classifier(domain: str, force_reset: bool = False) -> ZeroShotClassifier:
     if domain not in (config.DOMAIN_MARKET, config.DOMAIN_FOOD):
         raise ValueError(f"Unknown domain '{domain}'. Must be 'market' or 'food'.")
 
     with _loader_lock:
-        if domain in _classifiers:
+        if domain in _classifiers and not force_reset:
             _model_statuses[domain]["classifier"] = "ready"
             return _classifiers[domain]
         _model_statuses[domain]["classifier"] = "training"
@@ -161,18 +163,18 @@ def get_classifier(domain: str) -> ZeroShotClassifier:
         gk_tags = dicts.get("gk", [])
         if gk_tags:
             gk_embs = embed_engine.embed_dictionary_incremental(domain, "gk", gk_tags)
-            vector_store.upsert_tags(gk_tags, gk_embs["dense"], gk_embs["sparse"], "gk", domain=domain)
+            vector_store.upsert_tags(gk_tags, gk_embs["dense"], gk_embs["sparse"], "gk", domain=domain, force=force_reset)
 
         bt_tags = dicts.get("bt", [])
         if bt_tags:
             bt_embs = embed_engine.embed_dictionary_incremental(domain, "bt", bt_tags)
-            vector_store.upsert_tags(bt_tags, bt_embs["dense"], bt_embs["sparse"], "bt", domain=domain)
+            vector_store.upsert_tags(bt_tags, bt_embs["dense"], bt_embs["sparse"], "bt", domain=domain, force=force_reset)
 
         third_key = "region" if domain == config.DOMAIN_FOOD else "category"
         tt_tags = dicts.get(third_key, [])
         if tt_tags:
             tt_embs = embed_engine.embed_dictionary_incremental(domain, third_key, tt_tags)
-            vector_store.upsert_tags(tt_tags, tt_embs["dense"], tt_embs["sparse"], third_key, domain=domain)
+            vector_store.upsert_tags(tt_tags, tt_embs["dense"], tt_embs["sparse"], third_key, domain=domain, force=force_reset)
 
         classifier = ZeroShotClassifier(embed_engine, domain, descriptions, cat_df=cat_df, brands_df=brands_df)
         classifier.ner_engine = ner_engine

@@ -22,7 +22,7 @@ services:
       - MEILI_ENV=development
       - MEILI_MASTER_KEY=${MEILI_MASTER_KEY:-meilimasterkey}
     volumes:
-      - ./data/meilisearch_data:/meilisearch_data
+      - ./data/meilisearch_data:/meili_data
     restart: unless-stopped
 
   engine:

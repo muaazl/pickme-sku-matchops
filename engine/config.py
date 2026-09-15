@@ -151,6 +151,7 @@ REVIEW_THRESHOLD = 0.50
 # Any positive logit is treated as a relevant match.
 # Tune this here without touching tagger.py.
 RERANKER_THRESHOLD = 0.0
+RERANKER_MARGIN = 2.5  # Max logit drop from top candidate before subsequent candidates are pruned
 
 # Weighted embedding defaults: (Name, Description, Category)
 CLASSIFIER_WEIGHTS = (1.0, 0.8, 0.5)  # Classifier needs desc+cat context for disambiguation

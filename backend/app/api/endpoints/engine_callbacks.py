@@ -59,8 +59,9 @@ def update_progress(job_id: str, payload: JobProgressPayload):
     if last_stage != payload.current_stage:
         _job_stage[j_id] = payload.current_stage
         try:
-            conn = sqlite3.connect(DB_PATH)
+            conn = sqlite3.connect(DB_PATH, timeout=60.0)
             conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout=60000;")
             conn.execute(
                 "UPDATE jobs SET status = 'running', current_stage = ?, updated_at = datetime('now') WHERE id = ?",
                 (payload.current_stage, j_id)
@@ -81,8 +82,9 @@ def complete_job(job_id: str, payload: JobCompletePayload):
     _job_eta[j_id] = 0
 
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=60.0)
         conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=60000;")
 
         # Fetch job metadata to get domain and task
         job_row = conn.execute("SELECT domain, type FROM jobs WHERE id = ?", (j_id,)).fetchone()
@@ -197,8 +199,9 @@ def fail_job(job_id: str, payload: JobFailPayload):
     _job_eta[j_id] = None
 
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=60.0)
         conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=60000;")
         conn.execute(
             """
             UPDATE jobs SET

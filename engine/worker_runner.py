@@ -15,6 +15,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from engine.processor import process_request
+from engine.db import log_outbound_request
 
 logger = logging.getLogger("matchops.engine.worker")
 
@@ -183,12 +184,33 @@ def _worker_loop():
 
             # Post direct Google Sheets callback if provided
             if callback_url:
+                t0_cb = time.time()
                 try:
                     logger.info(f"[ENGINE WORKER] Delivering Google Sheets callback to {callback_url}...")
                     cb_resp = _http_session.post(callback_url, json=result_payload, timeout=120)
-                    logger.info(f"[ENGINE WORKER] Callback responded with status {cb_resp.status_code}")
+                    cb_dur = int((time.time() - t0_cb) * 1000)
+                    logger.info(f"[ENGINE WORKER] Callback responded with status {cb_resp.status_code} in {cb_dur}ms")
+                    log_outbound_request(
+                        url=callback_url,
+                        method="POST",
+                        payload=result_payload,
+                        response_status=cb_resp.status_code,
+                        response_text=cb_resp.text[:10000] if cb_resp.text else "",
+                        duration_ms=cb_dur,
+                        path="/doPost"
+                    )
                 except Exception as cb_err:
+                    cb_dur = int((time.time() - t0_cb) * 1000)
                     logger.error(f"[ENGINE WORKER] Google Sheets callback delivery failed: {cb_err}")
+                    log_outbound_request(
+                        url=callback_url,
+                        method="POST",
+                        payload=result_payload,
+                        response_status=500,
+                        response_text=str(cb_err),
+                        duration_ms=cb_dur,
+                        path="/doPost"
+                    )
 
         except InterruptedError:
             logger.info(f"[ENGINE WORKER] Job {job_id} cancelled successfully.")
@@ -224,10 +246,30 @@ def _worker_loop():
                     "spreadsheet_id": spreadsheet_id,
                     "task": task
                 }
+                t0_cb = time.time()
                 try:
-                    _http_session.post(callback_url, json=err_payload, timeout=30)
-                except Exception:
-                    pass
+                    cb_resp = _http_session.post(callback_url, json=err_payload, timeout=30)
+                    cb_dur = int((time.time() - t0_cb) * 1000)
+                    log_outbound_request(
+                        url=callback_url,
+                        method="POST",
+                        payload=err_payload,
+                        response_status=cb_resp.status_code,
+                        response_text=cb_resp.text[:10000] if cb_resp.text else "",
+                        duration_ms=cb_dur,
+                        path="/doPost"
+                    )
+                except Exception as cb_err:
+                    cb_dur = int((time.time() - t0_cb) * 1000)
+                    log_outbound_request(
+                        url=callback_url,
+                        method="POST",
+                        payload=err_payload,
+                        response_status=500,
+                        response_text=str(cb_err),
+                        duration_ms=cb_dur,
+                        path="/doPost"
+                    )
 
         finally:
             _batch_queue.task_done()

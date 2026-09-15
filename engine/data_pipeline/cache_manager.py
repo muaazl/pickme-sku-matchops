@@ -172,26 +172,27 @@ class CacheManager:
         # Verify Qdrant collection status
         collection_name = self.vector_store._get_collection_name(domain)
         collection_missing_or_empty = False
+        cnt = 0
         try:
             if not self.vector_store.client.collection_exists(collection_name):
                 collection_missing_or_empty = True
             else:
                 cnt = self.vector_store.client.count(collection_name).count
-                if cnt == 0 and len(raw_catalog) > 0:
+                if (cnt == 0 or cnt < len(raw_catalog)) and len(raw_catalog) > 0:
                     collection_missing_or_empty = True
         except Exception as e:
             logger.warning(f"[CACHE] [{domain.upper()}] Could not verify Qdrant collection '{collection_name}': {e}")
             collection_missing_or_empty = True
 
         if collection_missing_or_empty:
-            logger.info(f"[CACHE] [{domain.upper()}] Qdrant collection '{collection_name}' is missing or empty. Vectorizing and syncing catalog...")
+            logger.info(f"[CACHE] [{domain.upper()}] Qdrant collection '{collection_name}' has {cnt} items (expected {len(raw_catalog)}). Vectorizing and syncing catalog...")
             force_sync = True
         else:
-            logger.info(f"[CACHE] [{domain.upper()}] Checking for catalog updates...")
+            logger.info(f"[CACHE] [{domain.upper()}] Checking for catalog updates (Qdrant points: {cnt}/{len(raw_catalog)})...")
 
         # If we do not need to check for updates, collection exists in Qdrant, and cache is populated, return immediately
         if not force_sync and not collection_missing_or_empty and not check_for_updates and "clean_text" in processed_catalog.columns and not processed_catalog["clean_text"].isna().all():
-            logger.info(f"[CACHE] [{domain.upper()}] Loaded metadata from local cache and verified Qdrant collection '{collection_name}'.")
+            logger.info(f"[CACHE] [{domain.upper()}] Loaded metadata from local cache and verified Qdrant collection '{collection_name}' ({cnt} points).")
             return processed_catalog, self.vector_store
 
         # Identify changed or new rows using stable name-based UIDs
@@ -303,7 +304,9 @@ class CacheManager:
 
         # 6. Finalize Local Cache (update SQLite DB)
         import sqlite3
-        conn = sqlite3.connect(config.DB_PATH)
+        conn = sqlite3.connect(config.DB_PATH, timeout=60.0)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=60000;")
         try:
             for list_idx, (orig_idx, row) in enumerate(changed_df.iterrows()):
                 entities_val = row.get("entities")

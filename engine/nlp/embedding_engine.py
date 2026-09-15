@@ -82,14 +82,23 @@ class EmbeddingEngine:
                 except Exception as exp_err:
                     logger.warning(f"[EMBED] Auto-export BGE-Reranker failed ({exp_err}); will attempt PyTorch fallback.")
 
+            # 1. Load Tokenizer
             try:
                 try:
                     self.rerank_tokenizer = AutoTokenizer.from_pretrained(
-                        os.path.dirname(config.CROSS_ENCODER_ONNX), local_files_only=True, fix_mistral_regex=True
+                        os.path.dirname(config.CROSS_ENCODER_ONNX), local_files_only=True
+                    )
+                except TypeError:
+                    self.rerank_tokenizer = AutoTokenizer.from_pretrained(
+                        os.path.dirname(config.CROSS_ENCODER_ONNX), local_files_only=True
                     )
                 except Exception:
-                    self.rerank_tokenizer = AutoTokenizer.from_pretrained(config.CROSS_ENCODER_MODEL, fix_mistral_regex=True)
+                    self.rerank_tokenizer = AutoTokenizer.from_pretrained(config.CROSS_ENCODER_MODEL)
+            except Exception as tok_err:
+                logger.warning(f"[EMBED] Cross-Encoder tokenizer loading encountered issue: {tok_err}")
 
+            # 2. Load ONNX Session
+            try:
                 self.cross_session = ort.InferenceSession(
                     config.CROSS_ENCODER_ONNX, sess_options, providers=['CPUExecutionProvider']
                 )
@@ -210,11 +219,14 @@ class EmbeddingEngine:
 
     def score_cross_encoder(self, pairs: List[List[str]], batch_size: int = 32) -> np.ndarray:
         """Scores candidate pairs using the Cross-Encoder reranker (ONNX) in batches."""
-        if not self.cross_session:
-            return self.cross_encoder_fallback.predict(pairs, show_progress_bar=False)
-
         if not pairs:
             return np.array([], dtype=np.float32)
+
+        if not self.cross_session or not self.rerank_tokenizer:
+            if self.cross_encoder_fallback is not None:
+                return self.cross_encoder_fallback.predict(pairs, show_progress_bar=False)
+            logger.error("[EMBED] Cross-encoder unavailable (neither ONNX nor PyTorch fallback); returning -10.0 sentinels.")
+            return np.full(len(pairs), -10.0, dtype=np.float32)
 
         scores = []
         iterator = tqdm(range(0, len(pairs), batch_size), desc=f"Cross-Encoder (Total Pairs: {len(pairs)})")
