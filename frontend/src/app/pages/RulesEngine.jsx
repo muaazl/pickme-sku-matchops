@@ -12,7 +12,6 @@ import {
   Switch,
   FormControlLabel,
   Chip,
-  Grid,
   Drawer,
   Table,
   TableCell,
@@ -22,7 +21,7 @@ import {
 import { Plus, Trash2, Play, FlaskConical, GripVertical, Pencil, X, Sparkles } from 'lucide-react';
 import { useSnackbar } from 'notistack';
 import { PageContainer, PageHeader, StatusChip, ConfirmDialog } from '../components/ui';
-import { RULE_MODULES, CONDITION_TYPES, ACTION_TYPES, DOMAINS } from '../constants';
+import { CONDITION_TYPES, ACTION_TYPES, DOMAINS } from '../constants';
 import { JsonBlock } from '../components/JsonBlock';
 import TagAutocomplete from '../components/rules/TagAutocomplete';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
@@ -41,7 +40,6 @@ const emptyRule = (currentRules = []) => {
   return {
     rule_id: `new_rule_${Math.floor(Math.random() * 900 + 100)}`,
     domain: 'market',
-    module: 'bt_override',
     priority: maxPriority + 10,
     description: '',
     reasoning: '',
@@ -56,7 +54,6 @@ export default function RulesEngine() {
   const { enqueueSnackbar } = useSnackbar();
   const queryClient = useQueryClient();
   const [domain, setDomain] = useState('all');
-  const [module, setModule] = useState('all');
   const [editing, setEditing] = useState(null);
   const [sample, setSample] = useState('{\n  "sku_name": "Red Bull Energy Drink 250ml",\n  "domain": "market"\n}');
   const [testResult, setTestResult] = useState(null);
@@ -69,15 +66,11 @@ export default function RulesEngine() {
   // Reset page when filter changes
   React.useEffect(() => {
     setPage(0);
-  }, [domain, module]);
+  }, [domain]);
 
   const { data: serverRules = [], isLoading } = useQuery({
-    queryKey: ['rules', domain, module],
-    queryFn: () =>
-      getRules({
-        ...(domain !== 'all' && { domain }),
-        ...(module !== 'all' && { module }),
-      }),
+    queryKey: ['rules', domain],
+    queryFn: () => getRules({ ...(domain !== 'all' && { domain }) }),
   });
 
   const filtered = useMemo(() => {
@@ -134,7 +127,6 @@ export default function RulesEngine() {
     const newIds = localRules.map((r) => r.rule_id).join(',');
     if (initialIds !== newIds) {
       reorderMutation.mutate({
-        module: module,
         ordered_rule_ids: localRules.map((r) => r.rule_id),
       });
     }
@@ -268,7 +260,7 @@ export default function RulesEngine() {
     <PageContainer>
       <PageHeader
         title="Rules Engine"
-        subtitle="Domain- and module-scoped rules. Edit conditions/actions and test against a sample."
+        subtitle="Domain-scoped rules. Edit conditions/actions and test against a sample."
         actions={
           <Button
             variant="contained"
@@ -300,21 +292,6 @@ export default function RulesEngine() {
               </MenuItem>
             ))}
           </TextField>
-          <TextField
-            select
-            size="small"
-            label="Module"
-            value={module}
-            onChange={(e) => setModule(e.target.value)}
-            sx={{ width: 180 }}
-          >
-            <MenuItem value="all">All modules</MenuItem>
-            {RULE_MODULES.map((m) => (
-              <MenuItem key={m} value={m}>
-                {m}
-              </MenuItem>
-            ))}
-          </TextField>
         </Stack>
       </Card>
 
@@ -325,7 +302,6 @@ export default function RulesEngine() {
               <StyledHeaderCell width="50px" />
               <StyledHeaderCell width="15%">Rule ID</StyledHeaderCell>
               <StyledHeaderCell width="12%">Domain</StyledHeaderCell>
-              <StyledHeaderCell width="15%">Module</StyledHeaderCell>
               <StyledHeaderCell>Description</StyledHeaderCell>
               <StyledHeaderCell width="12%">Status</StyledHeaderCell>
               <StyledHeaderCell align="right" width="10%">
@@ -335,10 +311,10 @@ export default function RulesEngine() {
           </StyledTableHead>
           <StyledTableBody>
             {isLoading ? (
-              <TableSkeleton columns={7} rows={5} />
+              <TableSkeleton columns={6} rows={5} />
             ) : paginatedRows.length === 0 ? (
               <StyledTableRow>
-                <TableCell colSpan={7} align="center">
+                <TableCell colSpan={6} align="center">
                   <Typography variant="body2" color="text.secondary">
                     No rules found.
                   </Typography>
@@ -360,7 +336,7 @@ export default function RulesEngine() {
                     }}
                   >
                     <TableCell onClick={(e) => e.stopPropagation()} sx={{ width: '50px' }}>
-                      {module !== 'all' ? (
+                      {domain !== 'all' ? (
                         <Box
                           draggable
                           onDragStart={(e) => handleDragStart(e, index)}
@@ -388,7 +364,7 @@ export default function RulesEngine() {
                             color: 'text.disabled',
                             opacity: 0.5,
                           }}
-                          title="Select a specific module to enable reordering"
+                          title="Select a specific domain to enable reordering"
                         >
                           <GripVertical size={16} />
                         </Box>
@@ -396,7 +372,6 @@ export default function RulesEngine() {
                     </TableCell>
                     <TableCell>{row.rule_id}</TableCell>
                     <TableCell sx={{ textTransform: 'capitalize' }}>{row.domain}</TableCell>
-                    <TableCell>{row.module}</TableCell>
                     <TableCell>{row.description}</TableCell>
                     <TableCell>
                       <StatusChip status={row.is_active ? 'active' : 'disabled'} />
@@ -483,40 +458,20 @@ export default function RulesEngine() {
                 onChange={(e) => setEditing({ ...editing, description: e.target.value })}
                 size="small"
               />
-              <Grid container spacing={2}>
-                <Grid size={6}>
-                  <TextField
-                    select
-                    label="Domain"
-                    value={editing.domain}
-                    onChange={(e) => setEditing({ ...editing, domain: e.target.value })}
-                    size="small"
-                    fullWidth
-                  >
-                    {DOMAINS.map((d) => (
-                      <MenuItem key={d} value={d}>
-                        {d}
-                      </MenuItem>
-                    ))}
-                  </TextField>
-                </Grid>
-                <Grid size={6}>
-                  <TextField
-                    select
-                    label="Module"
-                    value={editing.module}
-                    onChange={(e) => setEditing({ ...editing, module: e.target.value })}
-                    size="small"
-                    fullWidth
-                  >
-                    {RULE_MODULES.map((m) => (
-                      <MenuItem key={m} value={m}>
-                        {m}
-                      </MenuItem>
-                    ))}
-                  </TextField>
-                </Grid>
-              </Grid>
+              <TextField
+                select
+                label="Domain"
+                value={editing.domain}
+                onChange={(e) => setEditing({ ...editing, domain: e.target.value })}
+                size="small"
+                fullWidth
+              >
+                {DOMAINS.map((d) => (
+                  <MenuItem key={d} value={d}>
+                    {d}
+                  </MenuItem>
+                ))}
+              </TextField>
               <FormControlLabel
                 control={
                   <Switch

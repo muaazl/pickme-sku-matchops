@@ -163,6 +163,11 @@ class ZeroShotClassifier:
         else:
             if hasattr(self, "_price_scaler") and self._price_scaler is not None:
                 scaled_prices = self._price_scaler.transform(log_prices)
+                # When price is 0.0 or not provided during inference, log1p(0) minus mean
+                # produces an extreme outlier z-score (~ -7.5) that corrupts text-based classification.
+                # Neutralize missing/zero prices by setting scaled price to 0.0 (the dataset mean).
+                zero_mask = (prices <= 0.0).flatten()
+                scaled_prices[zero_mask] = 0.0
             else:
                 scaled_prices = np.zeros_like(log_prices)
         return scaled_prices

@@ -1,3 +1,4 @@
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
@@ -82,14 +83,23 @@ class EmbeddingEngine:
                 except Exception as exp_err:
                     logger.warning(f"[EMBED] Auto-export BGE-Reranker failed ({exp_err}); will attempt PyTorch fallback.")
 
+            # 1. Load Tokenizer
             try:
                 try:
                     self.rerank_tokenizer = AutoTokenizer.from_pretrained(
-                        os.path.dirname(config.CROSS_ENCODER_ONNX), local_files_only=True, fix_mistral_regex=True
+                        os.path.dirname(config.CROSS_ENCODER_ONNX), local_files_only=True
+                    )
+                except TypeError:
+                    self.rerank_tokenizer = AutoTokenizer.from_pretrained(
+                        os.path.dirname(config.CROSS_ENCODER_ONNX), local_files_only=True
                     )
                 except Exception:
-                    self.rerank_tokenizer = AutoTokenizer.from_pretrained(config.CROSS_ENCODER_MODEL, fix_mistral_regex=True)
+                    self.rerank_tokenizer = AutoTokenizer.from_pretrained(config.CROSS_ENCODER_MODEL)
+            except Exception as tok_err:
+                logger.warning(f"[EMBED] Cross-Encoder tokenizer loading encountered issue: {tok_err}")
 
+            # 2. Load ONNX Session
+            try:
                 self.cross_session = ort.InferenceSession(
                     config.CROSS_ENCODER_ONNX, sess_options, providers=['CPUExecutionProvider']
                 )
@@ -137,15 +147,18 @@ class EmbeddingEngine:
             return {"dense": np.array([]), "sparse": []}
 
         if not hasattr(self, '_str_cache'):
-            self._str_cache = {}
-            
-        if len(self._str_cache) > 500000:
-            self._str_cache.clear()
+            # LRU (not "grow-then-wipe-everything") cache: an OrderedDict evicts the
+            # least-recently-used entries incrementally once over the cap, instead of a
+            # periodic full clear that both re-encodes frequently-used strings (dictionary
+            # tags, common SKU names) all at once and lets memory grow to the cap every time.
+            self._str_cache = OrderedDict()
 
         missing_texts = []
         missing_set = set()
         for text in texts:
-            if text not in self._str_cache and text not in missing_set:
+            if text in self._str_cache:
+                self._str_cache.move_to_end(text)
+            elif text not in missing_set:
                 missing_texts.append(text)
                 missing_set.add(text)
 
@@ -190,10 +203,14 @@ class EmbeddingEngine:
             for i, text in enumerate(missing_texts):
                 self._str_cache[text] = (flat_dense[i], all_sparse[i])
 
+            max_cache_size = 500000
+            while len(self._str_cache) > max_cache_size:
+                self._str_cache.popitem(last=False)
+
         dim = self._str_cache[texts[0]][0].shape[0]
         out_dense = np.empty((len(texts), dim), dtype=np.float32)
         out_sparse = []
-        
+
         for i, text in enumerate(texts):
             d, s = self._str_cache[text]
             out_dense[i] = d
@@ -210,11 +227,14 @@ class EmbeddingEngine:
 
     def score_cross_encoder(self, pairs: List[List[str]], batch_size: int = 32) -> np.ndarray:
         """Scores candidate pairs using the Cross-Encoder reranker (ONNX) in batches."""
-        if not self.cross_session:
-            return self.cross_encoder_fallback.predict(pairs, show_progress_bar=False)
-
         if not pairs:
             return np.array([], dtype=np.float32)
+
+        if not self.cross_session or not self.rerank_tokenizer:
+            if self.cross_encoder_fallback is not None:
+                return self.cross_encoder_fallback.predict(pairs, show_progress_bar=False)
+            logger.error("[EMBED] Cross-encoder unavailable (neither ONNX nor PyTorch fallback); returning -10.0 sentinels.")
+            return np.full(len(pairs), -10.0, dtype=np.float32)
 
         scores = []
         iterator = tqdm(range(0, len(pairs), batch_size), desc=f"Cross-Encoder (Total Pairs: {len(pairs)})")

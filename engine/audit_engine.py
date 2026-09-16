@@ -9,6 +9,8 @@ from engine import config
 from engine.nlp.text_cleaner import TextPipeline
 from engine.rules_engine import run_rules_engine
 from engine.classification.tagger import tag_all_skus
+from engine.utils.weight_utils import resolve_weight_bypass_candidate
+from engine.utils.flavor_utils import triage_input_flavors
 
 def run_sku_audit(
     sku_name: str,
@@ -69,12 +71,7 @@ def run_sku_audit(
         except Exception:
             pipeline = None
     
-    full_ner_input = sku_name
-    if description and str(description).lower() not in ("nan", "none", "<na>"):
-        full_ner_input += f" {description}"
-    if category and str(category).lower() not in ("nan", "none", "<na>"):
-        full_ner_input += f" {category}"
-        
+    full_ner_input = TextPipeline.build_ner_input(sku_name, description, category)
     ner_text = TextPipeline.prep_for_ner(full_ner_input)
     ner_engine = getattr(pipeline, "ner", None) if pipeline else None
     if ner_engine is None and classifier and hasattr(classifier, "ner_engine") and classifier.ner_engine:
@@ -157,43 +154,12 @@ def run_sku_audit(
             if isinstance(cand_indices, int):
                 cand_indices = [cand_indices]
 
-            selected_idx = cand_indices[0]
-            weight_reason = ""
-
-            if input_w_data[0] is not None:
-                in_val, _, in_type = input_w_data
-                best_match_idx = None
-                min_diff_pct = float("inf")
-
-                for c_idx in cand_indices:
-                    cat_row = pipeline.raw_catalog.iloc[c_idx]
-                    catalog_w_data = cat_row.get("weight_val")
-                    if catalog_w_data is not None and isinstance(catalog_w_data, (tuple, list)) and catalog_w_data[0] is not None:
-                        cat_val, _, cat_type = catalog_w_data
-                        if in_type == cat_type:
-                            max_val = max(in_val, cat_val)
-                            diff_pct = abs(in_val - cat_val) / max_val * 100 if max_val > 0 else 0
-                            if diff_pct < min_diff_pct:
-                                min_diff_pct = diff_pct
-                                best_match_idx = c_idx
-
-                if best_match_idx is not None:
-                    selected_idx = best_match_idx
-                    cat_row = pipeline.raw_catalog.iloc[selected_idx]
-                    catalog_w_data = cat_row.get("weight_val")
-                    cat_val = catalog_w_data[0]
-                    if min_diff_pct < 1.0:
-                        weight_reason = f" | Weight Match ({int(in_val)})"
-                    else:
-                        weight_reason = f" | Weight Mismatch ({int(in_val)} vs {int(cat_val)})"
-                else:
-                    cat_row = pipeline.raw_catalog.iloc[selected_idx]
-                    catalog_w_data = cat_row.get("weight_val")
-                    if catalog_w_data is not None and isinstance(catalog_w_data, (tuple, list)) and catalog_w_data[0] is not None:
-                        weight_reason = f" | Weight Mismatch ({int(in_val)} vs {int(catalog_w_data[0])})"
+            selected_idx, weight_reason = resolve_weight_bypass_candidate(
+                pipeline.raw_catalog, cand_indices, input_w_data
+            )
 
             exact_bypass_row = pipeline.raw_catalog.iloc[selected_idx]
-            exact_bypass_reason = f"Whole-SKU Fuzzy Match (100%){weight_reason}"
+            exact_bypass_reason = f"Fuzzy Match (100%){weight_reason}"
 
     # -------------------------------------------------------------
     # Stage 2: Basic Type Prediction & Candidate Search
@@ -210,7 +176,7 @@ def run_sku_audit(
     if pipeline.classifier:
         try:
             bt_tag, confidence, source = pipeline.classifier.predict_bt(input_vec_dense, price=price)
-            threshold = 0.40 if source == "zero-shot" else 0.50
+            threshold = config.get_bt_confidence_threshold(source)
             applied = (confidence >= threshold)
             if applied:
                 bt_filter = bt_tag
@@ -398,7 +364,7 @@ def run_sku_audit(
         best_res = {
             "candidate_name": str(exact_bypass_row["Name"]),
             "raw_cross_score": 100.0,
-            "computed_score": 100.0,
+            "computed_score": 1.0,
             "status": "High Confidence",
             "fuzzy_bypass": True,
             "reasons": exact_bypass_reason,
@@ -496,51 +462,77 @@ def run_sku_audit(
     orig_gk = winner_gk
 
     if winner is not None and domain == config.DOMAIN_FOOD and getattr(pipeline, "flavor_categories", None):
-        input_flavors = set()
-        if extracted_entities and isinstance(extracted_entities, dict):
-            input_flavors.update(x.lower() for x in extracted_entities.get("flavor", set()) if x)
-        resolved_input_flavors = pipeline.rules._resolve_flavors(input_flavors) if hasattr(pipeline.rules, "_resolve_flavors") else input_flavors
-
-        input_meats = {f for f in resolved_input_flavors if pipeline.flavor_categories.get(f, (False, False, False))[0] and not pipeline.flavor_categories.get(f, (False, False, False))[2]}
-        input_seafoods = {f for f in resolved_input_flavors if pipeline.flavor_categories.get(f, (False, False, False))[2]}
-        input_vegs = {f for f in resolved_input_flavors if pipeline.flavor_categories.get(f, (False, False, False))[1]}
+        input_meats, input_seafoods, input_vegs = triage_input_flavors(
+            pipeline.rules, pipeline.flavor_categories, extracted_entities, winner
+        )
 
         if winner_gk:
             kws = [k.strip() for k in winner_gk.split(",") if k.strip()]
             filtered_kws = []
+            seafood_pat = getattr(pipeline, "_seafood_pattern", None)
+            mixed_pat = getattr(pipeline, "_mixed_pattern", None)
+            veg_pat = getattr(pipeline, "_veg_pattern", None)
+            flavor_pat = getattr(pipeline, "_specific_flavor_pattern", None)
+
             for kw in kws:
                 kw_lower = kw.lower()
-                if any(re.search(r"\b" + re.escape(t) + r"\b", kw_lower) for t in pipeline.seafood_terms):
-                    has_input_seafood_term = any(re.search(r"\b" + re.escape(t) + r"\b", clean_input) for t in pipeline.seafood_terms)
+
+                # A. Check generic/literal keywords using dynamic term sets
+                if seafood_pat and seafood_pat.search(kw_lower):
+                    has_input_seafood_term = bool(seafood_pat.search(clean_input))
                     if not (has_input_seafood_term or input_seafoods):
                         continue
-                elif any(re.search(r"\b" + re.escape(t) + r"\b", kw_lower) for t in pipeline.mixed_terms):
-                    has_input_mixed_term = any(re.search(r"\b" + re.escape(t) + r"\b", clean_input) for t in pipeline.mixed_terms)
+                elif mixed_pat and mixed_pat.search(kw_lower):
+                    has_input_mixed_term = bool(mixed_pat.search(clean_input))
                     total_unique_items = len(input_meats) + len(input_seafoods)
                     is_mixed_by_flavors = (total_unique_items >= 2 and len(input_meats) >= 1)
                     if not (has_input_mixed_term or is_mixed_by_flavors):
                         continue
-                if any(re.search(r"\b" + re.escape(t) + r"\b", kw_lower) for t in pipeline.veg_terms):
-                    has_input_veg_term = any(re.search(r"\b" + re.escape(t) + r"\b", clean_input) for t in pipeline.veg_terms)
+                elif veg_pat and veg_pat.search(kw_lower):
+                    has_input_veg_term = bool(veg_pat.search(clean_input))
                     if not (has_input_veg_term or input_vegs):
                         continue
 
+                # B. Specific flavor terms check
                 keep_kw = True
-                for term, (is_meat, is_veg, is_seafood) in pipeline.flavor_categories.items():
-                    if term in pipeline.mixed_terms or term in pipeline.seafood_terms or term in pipeline.veg_terms:
-                        continue
-                    pattern = r"\b" + re.escape(term) + r"\b"
-                    if re.search(pattern, kw_lower):
+                if flavor_pat:
+                    for match in flavor_pat.finditer(kw_lower):
+                        term = match.group(1).lower()
+                        is_meat, is_veg, is_seafood = pipeline.flavor_categories.get(term, (False, False, False))
                         canonical = pipeline.rules.food_flavors_dict.get(term, term) if hasattr(pipeline.rules, "food_flavors_dict") else term
-                        if is_seafood and canonical not in input_seafoods:
-                            keep_kw = False; break
-                        elif is_meat and canonical not in input_meats:
-                            keep_kw = False; break
-                        elif is_veg and canonical not in input_vegs:
-                            keep_kw = False; break
+                        if is_seafood:
+                            if canonical not in input_seafoods:
+                                keep_kw = False
+                                break
+                        elif is_meat:
+                            if canonical not in input_meats:
+                                keep_kw = False
+                                break
+                        elif is_veg:
+                            if canonical not in input_vegs:
+                                keep_kw = False
+                                break
 
                 if keep_kw:
                     filtered_kws.append(kw)
+            winner_gk = ", ".join(filtered_kws)
+    elif winner is not None:
+        # Fallback/Market Domain logic: filter out all flavors (mirrors matcher.py)
+        flavors = set()
+        if extracted_entities and isinstance(extracted_entities, dict):
+            flavors.update(x.lower() for x in extracted_entities.get("flavor", set()) if x)
+        cat_ents = winner.get("entities")
+        if isinstance(cat_ents, dict):
+            flavors.update(x.lower() for x in cat_ents.get("flavor", set()) if x)
+
+        if flavors and winner_gk:
+            kws = [k.strip() for k in winner_gk.split(",") if k.strip()]
+            filtered_kws = []
+            for kw in kws:
+                kw_lower = kw.lower()
+                if any(f in kw_lower for f in flavors):
+                    continue
+                filtered_kws.append(kw)
             winner_gk = ", ".join(filtered_kws)
 
     def _clean_val(row, key):
@@ -632,7 +624,7 @@ def run_sku_audit(
                 tt_val = str(clf.get("suggested_region", clf.get("suggested_category", "")))
                 tt_conf = float(clf.get("region_confidence", clf.get("category_confidence", 0.0)))
 
-                matcher_norm = min(win_score / 100.0, 1.0)
+                matcher_norm = min(float(win_score), 1.0)
                 classifier_won = (bt_conf > matcher_norm)
                 pipeline_source = "Classifier" if classifier_won else "Matcher"
 
@@ -895,7 +887,7 @@ def _audit_classifier_pipeline(audit_data: dict, domain: str, sku_name: str, des
         "confidence": bt_conf,
         "source": bt_source,
         "status": bt_status,
-        "threshold": 0.40 if bt_source == "zero-shot" else 0.50,
+        "threshold": config.get_bt_confidence_threshold(bt_source),
         "flavor_conflict": flavor_conflict,
         "conflict_notes": conflict_notes,
         "top_candidates": bt_candidates
@@ -906,7 +898,7 @@ def _audit_classifier_pipeline(audit_data: dict, domain: str, sku_name: str, des
     # -------------------------------------------------------------
     from engine.classification.tagger import (
         get_strategy, _rrf_fusion, _weighted_fusion, _get_gk_regex,
-        FUSION_METHOD, TOP_K_FUSED, USE_RERANKER, RERANKER_THRESHOLD
+        FUSION_METHOD, TOP_K_FUSED, USE_RERANKER, RERANKER_THRESHOLD, RERANKER_MARGIN
     )
     strategy = get_strategy(classifier.domain)
 
@@ -1047,6 +1039,14 @@ def _audit_classifier_pipeline(audit_data: dict, domain: str, sku_name: str, des
                 "source": c.get("source", "hybrid_search")
             })
         scored_candidates.sort(key=lambda x: x["score"], reverse=True)
+        if scored_candidates:
+            top_score = scored_candidates[0]["score"]
+            margin_cutoff = max(RERANKER_THRESHOLD, top_score - RERANKER_MARGIN)
+            for item in scored_candidates:
+                if item["threshold_passed"] and item["score"] < margin_cutoff:
+                    item["threshold_passed"] = False
+                    item["prune_reason_override"] = f"Reranker score ({item['score']:.3f}) < margin cutoff ({margin_cutoff:.3f})"
+
         reranked_tags = [item["tag"] for item in scored_candidates if item["threshold_passed"]]
         if scored_candidates:
             final_conf = scored_candidates[0]["score"]
@@ -1113,7 +1113,7 @@ def _audit_classifier_pipeline(audit_data: dict, domain: str, sku_name: str, des
                 "reranker_score": s_item["score"],
                 "threshold_passed": s_item["threshold_passed"],
                 "flavor_filter_passed": True,
-                "prune_reason": None if s_item["threshold_passed"] else f"Reranker score ({s_item['score']:.3f}) < threshold ({RERANKER_THRESHOLD})",
+                "prune_reason": None if s_item["threshold_passed"] else s_item.get("prune_reason_override", f"Reranker score ({s_item['score']:.3f}) < threshold ({RERANKER_THRESHOLD})"),
                 "is_selected": is_kept
             }
         else:
@@ -1220,21 +1220,77 @@ def _audit_classifier_pipeline(audit_data: dict, domain: str, sku_name: str, des
     }
 
     # -------------------------------------------------------------
+    # Stage 4.5: Template Tag Enrichment
+    # -------------------------------------------------------------
+    template_applied = False
+    template_details = {}
+    curr_bt = predicted_bt
+    curr_gk_list = list(merged_gk)
+
+    if getattr(config, "ENABLE_TEMPLATE_TAG_ENRICHMENT", True):
+        try:
+            if bt_status not in ["High Confidence", "HIGH", "Exact Text Match"]:
+                from engine.template_suggest import suggest_tags_from_template
+                sug_res = suggest_tags_from_template(sku_name, domain=domain, current_bt=curr_bt)
+                if sug_res.get("matched"):
+                    template_applied = True
+                    s_bt = sug_res.get("suggested_bt", "")
+                    s_gk_list = sug_res.get("suggested_gk", [])
+                    s_gk = ", ".join(s_gk_list) if isinstance(s_gk_list, list) else str(s_gk_list)
+
+                    if s_bt:
+                        curr_bt = s_bt
+                        bt_conf = max(bt_conf, 0.95)
+                        bt_status = "AUTO"
+                        bt_source = "template"
+                    if s_gk:
+                        curr_gk_list = s_gk_list if isinstance(s_gk_list, list) else [x.strip() for x in s_gk.split(",") if x.strip()]
+                        gk_conf = max(gk_conf, 0.95)
+                        gk_status = "AUTO"
+
+                    template_details = {
+                        "matched_template": True,
+                        "base_sku": sug_res.get("base_sku", ""),
+                        "template_bt": s_bt,
+                        "template_gk": s_gk,
+                        "notes": f"Template tag enrichment applied from base SKU '{sug_res.get('base_sku', '')}'"
+                    }
+                else:
+                    template_details = {
+                        "matched_template": False,
+                        "note": sug_res.get("reason", "No template match found in catalog")
+                    }
+            else:
+                template_details = {
+                    "matched_template": False,
+                    "note": f"Skipped template enrichment because classifier BT status was {bt_status}"
+                }
+        except Exception as e:
+            template_details = {"matched_template": False, "error": str(e)}
+    else:
+        template_details = {
+            "matched_template": False,
+            "note": "Template tag enrichment is disabled in configuration"
+        }
+
+    audit_data["stage7_template_enrichment"] = template_details
+
+    # -------------------------------------------------------------
     # Stage 5: Business Rules Engine Execution
     # -------------------------------------------------------------
     rules_confidence = max(bt_conf, gk_conf, third_tag_conf)
     record = {
         "sku_name": sku_name,
         "domain": domain,
-        "bt": predicted_bt,
-        "gk": merged_gk,
+        "bt": curr_bt,
+        "gk": curr_gk_list,
         "region": chosen_third_tag if domain == config.DOMAIN_FOOD else None,
         "category": chosen_third_tag if domain == config.DOMAIN_MARKET else None,
         "price": price,
         "confidence": rules_confidence,
         "match_source": "classifier",
         "matched_sku": "",
-        "reasoning": f"Classifier predicted BT='{predicted_bt}', GK='{', '.join(merged_gk)}', {tag_label}='{chosen_third_tag}'"
+        "reasoning": f"Classifier predicted BT='{curr_bt}', GK='{', '.join(curr_gk_list)}', {tag_label}='{chosen_third_tag}'"
     }
 
     aug_record = run_rules_engine(record)
@@ -1246,7 +1302,7 @@ def _audit_classifier_pipeline(audit_data: dict, domain: str, sku_name: str, des
     audit_data["stage5_rules_engine"] = {
         "rules_applied_count": len(rules_applied),
         "rules_applied": rules_applied,
-        "pre_rules_tags": {"bt": predicted_bt, "gk": ", ".join(merged_gk), "region": chosen_third_tag},
+        "pre_rules_tags": {"bt": curr_bt, "gk": ", ".join(curr_gk_list), "region": chosen_third_tag},
         "post_rules_tags": {"bt": final_bt, "gk": final_gk, "region": final_region}
     }
 

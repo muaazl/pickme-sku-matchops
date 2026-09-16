@@ -16,7 +16,13 @@ from engine.resource_loader import _pipelines, get_pipeline, get_classifier
 
 logger = logging.getLogger("matchops.engine.template_suggest")
 
-_catalog_records_cache: Dict[tuple, List[Dict[str, Any]]] = {}
+# Per-domain cache of (dataframe reference, computed records). Keying on id(cat_df) alone
+# is unsafe: once the old DataFrame is garbage collected, Python can reuse its address for
+# an unrelated new DataFrame, which would then incorrectly hit a stale cache entry. Holding
+# a live reference to the cached DataFrame prevents that — either the SAME object comes back
+# (safe cache hit via `is`) or a genuinely new one does (the reference keeps the old id from
+# ever being reused for it), and it naturally caps the cache to one entry per domain.
+_catalog_records_cache: Dict[str, tuple] = {}
 
 def get_catalog_and_brands(domain: str):
     """Load catalog and brands/flavors from local Feather cache if possible, else fetch from sheets."""
@@ -26,11 +32,11 @@ def get_catalog_records(domain: str, cat_df: Optional[pd.DataFrame] = None) -> L
     """Returns cached list of catalog row dictionaries for template suggestion and fast lookup."""
     if cat_df is None:
         cat_df, _ = get_catalog_and_brands(domain)
-    cache_key = (id(cat_df), domain)
-    if cache_key in _catalog_records_cache:
-        return _catalog_records_cache[cache_key]
+    cached = _catalog_records_cache.get(domain)
+    if cached is not None and cached[0] is cat_df:
+        return cached[1]
     records = cat_df.to_dict('records')
-    _catalog_records_cache[cache_key] = records
+    _catalog_records_cache[domain] = (cat_df, records)
     return records
 
 def get_classifier_dicts(domain: str) -> Dict[str, Any]:

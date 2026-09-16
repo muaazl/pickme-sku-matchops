@@ -1,6 +1,6 @@
 import React from 'react';
 import PropTypes from 'prop-types';
-import { Box, Chip, Stack, Typography } from '@mui/material';
+import { Box, Stack, Typography } from '@mui/material';
 
 export default function RulesAppliedList({ rules }) {
   if (!rules) {
@@ -61,9 +61,6 @@ export default function RulesAppliedList({ rules }) {
             <Typography variant="body2" sx={{ fontWeight: 600 }}>
               {rule.rule_id}
             </Typography>
-            {rule.module && (
-              <Chip label={rule.module} size="small" variant="outlined" sx={{ height: 20, fontSize: '0.7rem' }} />
-            )}
           </Box>
           {rule.description && (
             <Typography variant="body2" color="text.secondary">

@@ -75,7 +75,8 @@ def _apply_template_tag_enrichment(skus: List[Dict[str, Any]], results: List[dic
         for i, sku in enumerate(skus):
             if i >= len(results):
                 break
-            if results[i].get("status") in ["Exact Text Match", "High Confidence"]:
+            status_val = results[i].get("status") or results[i].get("bt_status")
+            if status_val in ["Exact Text Match", "High Confidence", "HIGH"]:
                 continue
             sku_name = sku.get("name", "")
             sug_res = suggest_tags_from_template(sku_name, domain=domain, current_bt=results[i].get("suggested_bt"))
@@ -435,20 +436,27 @@ def process_request(
                     clf = clf_results[j]
                     row = pipeline_out[orig_idx]
 
-                    row["suggested_bt"]      = str(clf.get("suggested_bt", ""))
-                    row["bt_confidence"]     = float(clf.get("bt_confidence", 0.0))
-                    row["bt_status"]         = str(clf.get("bt_status", ""))
-                    row["suggested_gk"]      = str(clf.get("suggested_gk", ""))
-                    row["gk_confidence"]     = float(clf.get("gk_confidence", 0.0))
-                    row["gk_status"]         = str(clf.get("gk_status", ""))
-                    row["suggested_region"]  = str(clf.get("suggested_region", clf.get("suggested_category", "")))
-                    row["region_confidence"] = float(clf.get("region_confidence", clf.get("category_confidence", 0.0)))
-                    row["region_status"]     = str(clf.get("region_status", clf.get("category_status", "")))
                     row["escalated"] = True
 
-                    matcher_norm   = min(row["score"] / 100.0, 1.0)
-                    clf_confidence = row["bt_confidence"]
-                    row["pipeline_source"] = "Classifier" if clf_confidence > matcher_norm else "Matcher"
+                    matcher_norm = min(float(row.get("score", 0.0)), 1.0)
+                    clf_confidence = float(clf.get("bt_confidence", 0.0))
+                    classifier_won = (clf_confidence > matcher_norm)
+                    row["pipeline_source"] = "Classifier" if classifier_won else "Matcher"
+
+                    if classifier_won:
+                        row["suggested_bt"]      = str(clf.get("suggested_bt", ""))
+                        row["bt_confidence"]     = float(clf.get("bt_confidence", 0.0))
+                        row["bt_status"]         = str(clf.get("bt_status", ""))
+                        row["suggested_gk"]      = str(clf.get("suggested_gk", ""))
+                        row["gk_confidence"]     = float(clf.get("gk_confidence", 0.0))
+                        row["gk_status"]         = str(clf.get("gk_status", ""))
+                        row["suggested_region"]  = str(clf.get("suggested_region", clf.get("suggested_category", "")))
+                        row["region_confidence"] = float(clf.get("region_confidence", clf.get("category_confidence", 0.0)))
+                        row["region_status"]     = str(clf.get("region_status", clf.get("category_status", "")))
+
+                        prior = str(row.get("logic_notes") or "").strip()
+                        clf_note = str(clf.get("reasoning", ""))
+                        row["logic_notes"] = f"Escalated from matcher [{prior}] -> {clf_note}" if prior else clf_note
 
                 import gc
                 gc.collect()

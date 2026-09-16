@@ -1,6 +1,7 @@
+import hmac
 import os
 from collections import deque
-from fastapi import APIRouter, Depends, HTTPException, Security
+from fastapi import APIRouter, Depends, HTTPException, Query, Security
 from fastapi.security.api_key import APIKeyHeader
 
 from backend.app.api.endpoints.batches import router as batches_router
@@ -40,7 +41,7 @@ api_router.include_router(engine_callbacks_router)
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 def get_api_key(api_key_header: str = Security(api_key_header)):
-    if api_key_header != config.API_KEY:
+    if not hmac.compare_digest(api_key_header or "", config.API_KEY):
         raise HTTPException(status_code=401, detail="Invalid API key.")
     return api_key_header
 
@@ -100,7 +101,7 @@ def pipeline(request: PipelineRequest, api_key: str = Depends(get_api_key)):
 
 
 @api_router.get("/logs")
-def get_logs(lines: int = 500):
+def get_logs(lines: int = Query(500, ge=1, le=20000)):
     """
     Returns the last N lines of the application logs.
     """

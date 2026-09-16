@@ -3,7 +3,6 @@ import logging
 import os
 import re
 import threading
-from collections import Counter
 from typing import Any, Dict, List, Optional
 
 import joblib
@@ -16,48 +15,13 @@ from engine.data_pipeline.ingestion import DataIngestion
 
 logger = logging.getLogger("matchops.catalog_service")
 
-# In-memory counter cache to avoid re-aggregating dataframe columns repeatedly
-_counters_cache: Dict[tuple, Counter] = {}
-_catalog_records_cache: Dict[tuple, List[Dict[str, Any]]] = {}
-
 _build_lock = threading.Lock()
 _build_in_progress = False
-
-
-def get_column_counter(df: pd.DataFrame, col_name: str, split_comma: bool = True) -> Counter:
-    """Computes and caches frequency counts for values in a DataFrame column."""
-    cache_key = (id(df), col_name, split_comma)
-    if cache_key in _counters_cache:
-        return _counters_cache[cache_key]
-        
-    counter = Counter()
-    if col_name in df.columns:
-        for val_str in df[col_name].dropna():
-            if split_comma:
-                for item in str(val_str).split(","):
-                    counter[item.strip().lower()] += 1
-            else:
-                counter[str(val_str).strip().lower()] += 1
-                
-    _counters_cache[cache_key] = counter
-    return counter
 
 
 def get_catalog_and_brands(domain: str):
     """Load catalog and brands/flavors from local Feather cache if possible, else fetch from sheets."""
     return DataIngestion.load_catalog(engine_config.GOOGLE_SHEET_ID, domain)
-
-
-def get_catalog_records(domain: str, cat_df: Optional[pd.DataFrame] = None) -> List[Dict[str, Any]]:
-    """Returns cached list of catalog row dictionaries for template suggestion and fast lookup."""
-    if cat_df is None:
-        cat_df, _ = get_catalog_and_brands(domain)
-    cache_key = (id(cat_df), domain)
-    if cache_key in _catalog_records_cache:
-        return _catalog_records_cache[cache_key]
-    records = cat_df.to_dict('records')
-    _catalog_records_cache[cache_key] = records
-    return records
 
 
 def get_classifier_dicts(domain: str) -> Dict[str, Any]:
@@ -102,6 +66,28 @@ def escape_meili_filter_value(val: str) -> str:
     return val.replace("\\", "\\\\").replace('"', '\\"')
 
 
+def _build_occurrence_uids(df: pd.DataFrame, name_col: str = "Name"):
+    """
+    Vectorized replacement for an iterrows()-based per-name occurrence counter.
+    Returns (raw_names, uids) as lists aligned to df's row order, where
+    uid = "{raw_name}#occ_{n}" (n = 1-based count of that name seen so far).
+
+    Uses .map(str) rather than .astype(str) so a real NaN stringifies to "nan"
+    (matching the str(x) semantics used elsewhere in this function) instead of
+    pandas treating it as a missing value, which would make groupby() drop
+    those rows and silently coerce cumcount()'s output to float.
+    """
+    if len(df) == 0:
+        return [], []
+    if name_col in df.columns:
+        raw_names = df[name_col].astype(object).map(str).str.strip().str.lower()
+    else:
+        raw_names = pd.Series([""] * len(df), index=df.index)
+    occ = raw_names.groupby(raw_names).cumcount() + 1
+    uids = (raw_names + "#occ_" + occ.astype(str)).tolist()
+    return raw_names.tolist(), uids
+
+
 def check_changes_for_domain(domain: str, limit: int = 50) -> dict:
     """Checks differences between Google Sheets and local SQLite cached catalog items."""
     import sqlite3
@@ -123,17 +109,17 @@ def check_changes_for_domain(domain: str, limit: int = 50) -> dict:
         else:
             cached_df = cached_df.rename(columns={"flavor": "Flavor"})
             
-        name_counts_old = {}
         cached_by_uid = {}
         cached_by_name = {}
-        for _, row in cached_df.iterrows():
-            raw_name = str(row.get("Name", "")).strip().lower()
-            name_counts_old[raw_name] = name_counts_old.get(raw_name, 0) + 1
-            uid = f"{raw_name}#occ_{name_counts_old[raw_name]}"
-            old_hashes[uid] = row.get("row_hash", "")
-            cached_by_uid[uid] = row
-            if raw_name not in cached_by_name:
-                cached_by_name[raw_name] = row
+        cached_raw_names, cached_uids = _build_occurrence_uids(cached_df)
+        if cached_uids:
+            row_hash_col = cached_df["row_hash"] if "row_hash" in cached_df.columns else pd.Series([""] * len(cached_df), index=cached_df.index)
+            cached_records = cached_df.to_dict("records")
+            old_hashes = dict(zip(cached_uids, row_hash_col))
+            cached_by_uid = dict(zip(cached_uids, cached_records))
+            for raw_name, record in zip(cached_raw_names, cached_records):
+                if raw_name not in cached_by_name:
+                    cached_by_name[raw_name] = record
     except Exception as db_err:
         logger.warning(f"Failed to load cached items from SQLite: {db_err}")
     finally:
@@ -168,13 +154,11 @@ def check_changes_for_domain(domain: str, limit: int = 50) -> dict:
     changed_rows = []
     total_new_count = 0
     total_changed_count = 0
-    
-    name_counts = {}
-    for idx, row in new_df.iterrows():
-        raw_name = str(row.get("Name", "")).strip().lower()
-        name_counts[raw_name] = name_counts.get(raw_name, 0) + 1
-        uid = f"{raw_name}#occ_{name_counts[raw_name]}"
-        
+
+    new_raw_names, new_uids = _build_occurrence_uids(new_df)
+    new_records = new_df.to_dict("records") if len(new_df) else []
+
+    for idx, row, uid, raw_name in zip(new_df.index, new_records, new_uids, new_raw_names):
         row_hash = calculate_row_hash(row, domain=domain)
         
         cleaned = {}
@@ -251,8 +235,6 @@ def _bg_build_cache():
     global _build_in_progress
     logger.info("Background cache build and pre-training started...")
     try:
-        _counters_cache.clear()
-        _catalog_records_cache.clear()
         for domain in ("market", "food"):
             logger.info(f"Rebuilding Feather cache for {domain}...")
             cat_df, _ = DataIngestion.load_catalog(engine_config.GOOGLE_SHEET_ID, domain=domain, force_fetch=True)

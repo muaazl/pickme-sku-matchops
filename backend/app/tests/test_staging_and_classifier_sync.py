@@ -137,8 +137,8 @@ class TestStagingAndClassifierSync(unittest.TestCase):
     @patch("engine.scripts.sync_catalog.DataIngestion.load_catalog")
     @patch("engine.scripts.sync_catalog.DataIngestion.load_classifier_dictionaries")
     def test_rebuild_disk_caches_safe_token_count(self, mock_load_dicts, mock_load_cat):
-        from engine.scripts.sync_catalog import rebuild_disk_caches
-        
+        from engine.scripts.sync_catalog import sync_cache
+
         # Test catalog with None/float/missing clean_text
         sample_df = pd.DataFrame({
             "Name": ["Coca Cola 250ml", "Pepsi Max 500ml", "Sprite 1l"],
@@ -146,12 +146,12 @@ class TestStagingAndClassifierSync(unittest.TestCase):
             "clean_text": [None, np.nan, "sprite 1l"]
         })
         brands_df = pd.DataFrame({"Brand Name": ["coca cola", "pepsi"], "Aliases": ["", ""]})
-        
+
         mock_load_cat.return_value = (sample_df, brands_df)
         mock_load_dicts.return_value = {"gk": ["soda"], "bt": ["beverage"], "category": ["drinks"]}
-        
+
         # Should not raise AttributeError: Can only use .str accessor with string values, not floating
-        rebuild_disk_caches("market", "test_sheet_id")
+        sync_cache("market", "test_sheet_id", "rebuild")
         
         metadata_path = os.path.join(config.CACHE_DIR, "market_catalog_metadata.pkl")
         self.assertTrue(os.path.exists(metadata_path))

@@ -1,3 +1,5 @@
+import * as XLSX from 'xlsx';
+
 /**
  * Parses raw CSV / TSV text handling quotes, escaped quotes, and newlines.
  * @param {string} text - The raw CSV/TSV input text.
@@ -86,4 +88,42 @@ export function mapRows(headers, rows) {
     description: row[descCol] || '',
     category: row[catCol] || '',
   }));
+}
+
+/**
+ * Parses an uploaded Excel workbook (.xlsx/.xls) into one { headers, rows } entry per
+ * non-empty sheet/tab, in the same shape parseCSV produces — so each tab can be fed
+ * straight into mapRows() and treated exactly like an independent uploaded CSV.
+ * @param {ArrayBuffer} arrayBuffer - The raw workbook file contents.
+ * @return {Record<string, { headers: string[], rows: Array<Object.<string, string>> }>}
+ */
+export function parseExcelWorkbook(arrayBuffer) {
+  const workbook = XLSX.read(arrayBuffer, { type: 'array' });
+  const result = {};
+
+  workbook.SheetNames.forEach((sheetName) => {
+    const sheet = workbook.Sheets[sheetName];
+    const grid = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: '' });
+    if (!grid || grid.length === 0) return;
+
+    const headers = (grid[0] || []).map((h) => String(h ?? '').trim());
+    if (headers.every((h) => !h)) return;
+
+    const rows = [];
+    for (let i = 1; i < grid.length; i++) {
+      const values = grid[i] || [];
+      if (values.every((v) => String(v ?? '').trim() === '')) continue;
+      const rowObj = {};
+      headers.forEach((header, idx) => {
+        rowObj[header] = values[idx] !== undefined ? String(values[idx]).trim() : '';
+      });
+      rows.push(rowObj);
+    }
+
+    if (rows.length > 0) {
+      result[sheetName] = { headers, rows };
+    }
+  });
+
+  return result;
 }

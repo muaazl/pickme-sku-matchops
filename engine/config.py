@@ -147,10 +147,18 @@ COL_BT = "basictype"
 AUTO_THRESHOLD = 0.80
 REVIEW_THRESHOLD = 0.50
 
+BT_ZERO_SHOT_CONFIDENCE_THRESHOLD = 0.40
+BT_DEFAULT_CONFIDENCE_THRESHOLD = 0.50
+
+def get_bt_confidence_threshold(source: str) -> float:
+    """Minimum confidence required to apply a predicted basic-type filter, by prediction source."""
+    return BT_ZERO_SHOT_CONFIDENCE_THRESHOLD if source == "zero-shot" else BT_DEFAULT_CONFIDENCE_THRESHOLD
+
 # Cross-encoder returns raw logits (not probabilities).
 # Any positive logit is treated as a relevant match.
 # Tune this here without touching tagger.py.
 RERANKER_THRESHOLD = 0.0
+RERANKER_MARGIN = 2.5  # Max logit drop from top candidate before subsequent candidates are pruned
 
 # Weighted embedding defaults: (Name, Description, Category)
 CLASSIFIER_WEIGHTS = (1.0, 0.8, 0.5)  # Classifier needs desc+cat context for disambiguation

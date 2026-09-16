@@ -1,6 +1,8 @@
+import json
+import logging
 import os
 import sqlite3
-import logging
+import uuid
 from engine import config
 
 logger = logging.getLogger("matchops.db")
@@ -11,7 +13,6 @@ CREATE TABLE IF NOT EXISTS rules (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     rule_id         TEXT UNIQUE NOT NULL,
     domain          TEXT NOT NULL,
-    module          TEXT NOT NULL,
     priority        INTEGER NOT NULL DEFAULT 100,
     description     TEXT NOT NULL,
     reasoning       TEXT NOT NULL,
@@ -98,6 +99,9 @@ CREATE TABLE IF NOT EXISTS processed_skus (
     bt_confidence REAL,
     gk_confidence REAL,
     region_confidence REAL,
+    input_price REAL,
+    input_description TEXT,
+    input_category TEXT,
     created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -174,7 +178,7 @@ CREATE TABLE IF NOT EXISTS bt_gk_map (
 -- 9. Indexes for Performance
 CREATE INDEX IF NOT EXISTS idx_conditions_rule_id ON conditions(rule_id);
 CREATE INDEX IF NOT EXISTS idx_actions_rule_id ON actions(rule_id);
-CREATE INDEX IF NOT EXISTS idx_rules_domain_module ON rules(domain, module, priority);
+CREATE INDEX IF NOT EXISTS idx_rules_domain_priority ON rules(domain, priority);
 CREATE INDEX IF NOT EXISTS idx_jobs_started_at ON jobs(started_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_status_started ON jobs(status, started_at);
 CREATE INDEX IF NOT EXISTS idx_api_requests_created_at ON api_requests(created_at);
@@ -188,7 +192,9 @@ CREATE INDEX IF NOT EXISTS idx_processed_skus_batch_id ON processed_skus(batch_i
 CREATE INDEX IF NOT EXISTS idx_processed_skus_domain_created ON processed_skus(domain, created_at);
 """
 
-def ensure_db_initialized(conn_or_path=None) -> sqlite3.Connection:
+_initialized_databases = set()
+
+def ensure_db_initialized(conn_or_path=None, force: bool = False) -> sqlite3.Connection:
     """
     Ensures that the SQLite database directory exists, WAL mode is active,
     and all required tables and indexes are created.
@@ -197,18 +203,57 @@ def ensure_db_initialized(conn_or_path=None) -> sqlite3.Connection:
     
     if is_provided_conn:
         conn = conn_or_path
+        db_path = None
     else:
-        db_path = conn_or_path if isinstance(conn_or_path, str) else config.DB_PATH
-        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
-        conn = sqlite3.connect(db_path, check_same_thread=False)
+        raw_path = conn_or_path if isinstance(conn_or_path, str) else config.DB_PATH
+        db_path = os.path.abspath(raw_path)
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        conn = sqlite3.connect(db_path, timeout=60.0, check_same_thread=False)
 
     try:
         conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=60000;")
+
+        # If already initialized in this process, skip expensive DDL and migration writes only if tables exist
+        if db_path and db_path in _initialized_databases and not force:
+            tbl_check = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='catalog_items'").fetchone()
+            if tbl_check:
+                return conn
+
         conn.executescript(SCHEMA_SQL)
-        
+
         # Apply any column migrations if necessary
         cursor = conn.cursor()
-        
+
+        # rules table: drop legacy 'module' column (the rules-engine module concept was removed;
+        # rules now run as a single flat, priority-ordered list per domain).
+        cursor.execute("PRAGMA table_info(rules);")
+        rules_cols = [row[1] for row in cursor.fetchall()]
+        if "module" in rules_cols:
+            conn.execute("DROP INDEX IF EXISTS idx_rules_domain_module;")
+            conn.execute("""
+                CREATE TABLE rules_new (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    rule_id         TEXT UNIQUE NOT NULL,
+                    domain          TEXT NOT NULL,
+                    priority        INTEGER NOT NULL DEFAULT 100,
+                    description     TEXT NOT NULL,
+                    reasoning       TEXT NOT NULL,
+                    condition_logic TEXT NOT NULL DEFAULT 'AND',
+                    is_active       INTEGER NOT NULL DEFAULT 1,
+                    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+            """)
+            conn.execute("""
+                INSERT INTO rules_new (id, rule_id, domain, priority, description, reasoning, condition_logic, is_active, created_at, updated_at)
+                SELECT id, rule_id, domain, priority, description, reasoning, condition_logic, is_active, created_at, updated_at FROM rules;
+            """)
+            conn.execute("DROP TABLE rules;")
+            conn.execute("ALTER TABLE rules_new RENAME TO rules;")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_rules_domain_priority ON rules(domain, priority);")
+            logger.info("[DB] Migrated 'rules' table: dropped legacy 'module' column.")
+
         # api_requests columns
         cursor.execute("PRAGMA table_info(api_requests);")
         api_cols = [row[1] for row in cursor.fetchall()]
@@ -243,7 +288,10 @@ def ensure_db_initialized(conn_or_path=None) -> sqlite3.Connection:
             "match_score": "REAL",
             "bt_confidence": "REAL",
             "gk_confidence": "REAL",
-            "region_confidence": "REAL"
+            "region_confidence": "REAL",
+            "input_price": "REAL",
+            "input_description": "TEXT",
+            "input_category": "TEXT"
         }
         for col_name, col_type in new_cols_skus.items():
             if col_name not in sku_cols:
@@ -276,7 +324,13 @@ def ensure_db_initialized(conn_or_path=None) -> sqlite3.Connection:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_brand_flavors_count ON brand_flavors(domain, catalog_count DESC);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_bt_gk_map_count ON bt_gk_map(domain, catalog_count DESC);")
 
+        # Data scale migration: normalize legacy 100.0 scale down to 1.0 in processed_skus
+        conn.execute("UPDATE processed_skus SET confidence = confidence / 100.0 WHERE confidence > 1.0;")
+        conn.execute("UPDATE processed_skus SET match_score = match_score / 100.0 WHERE match_score > 1.0;")
+
         conn.commit()
+        if db_path:
+            _initialized_databases.add(db_path)
     except Exception as e:
         logger.error(f"[DB] Error ensuring database initialization: {e}")
         if not is_provided_conn:
@@ -285,7 +339,59 @@ def ensure_db_initialized(conn_or_path=None) -> sqlite3.Connection:
 
     return conn
 
-def init_db(db_path: str = None) -> None:
+def clear_db_cache(db_path: str = None) -> None:
+    """Clears the cached initialization flag for a database path."""
+    if db_path:
+        _initialized_databases.discard(os.path.abspath(db_path))
+    else:
+        _initialized_databases.clear()
+
+def init_db(db_path: str = None, force: bool = True) -> None:
     """Public helper to initialize the SQLite database."""
-    conn = ensure_db_initialized(db_path)
+    conn = ensure_db_initialized(db_path, force=force)
     conn.close()
+
+
+def log_outbound_request(
+    url: str,
+    method: str,
+    payload: object,
+    response_status: int,
+    response_text: str,
+    duration_ms: int,
+    path: str = "/doPost"
+) -> None:
+    """Logs outbound HTTP requests (e.g. Google Sheets webhooks) to SQLite."""
+    try:
+        req_id = str(uuid.uuid4())
+        conn = sqlite3.connect(config.DB_PATH, timeout=60.0)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=60000;")
+
+        payload_str = json.dumps(payload) if isinstance(payload, (dict, list)) else str(payload)
+        resp_str = str(response_text) if response_text is not None else ""
+
+        conn.execute(
+            """
+            INSERT INTO api_requests (id, method, path, payload_json_redacted, response_json, status_code, duration_ms, ip_address, headers_json, query_params_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                req_id,
+                method,
+                path,
+                payload_str,
+                resp_str,
+                response_status,
+                duration_ms,
+                "outbound",
+                json.dumps({"Content-Type": "application/json"}),
+                json.dumps({"callback_url": url})
+            )
+        )
+        conn.commit()
+        conn.close()
+        logger.info(f"[DB] Logged outbound {method} request to {path} (status {response_status}) in api_requests.")
+    except Exception as e:
+        logger.error(f"[DB] Failed to log outbound request to DB: {e}")
+

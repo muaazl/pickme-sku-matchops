@@ -2,6 +2,14 @@ import sqlite3
 from typing import Optional, List, Dict, Any
 from backend.app.schemas.models import RuleModel
 from engine.rules_engine import refresh_rules_cache
+from backend.app.services.engine_client import refresh_engine_rules
+
+
+def _refresh_rules_everywhere() -> None:
+    """Refreshes the rules cache in this (backend) process and notifies the live engine
+    process to do the same, so rule changes take effect immediately for real jobs."""
+    refresh_rules_cache()
+    refresh_engine_rules()
 
 
 def get_next_rule_id(db: sqlite3.Connection) -> str:
@@ -17,20 +25,16 @@ def get_next_rule_id(db: sqlite3.Connection) -> str:
 
 def get_rules_list(
     db: sqlite3.Connection,
-    domain: Optional[str] = None,
-    module: Optional[str] = None
+    domain: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """Fetches all rules along with their associated conditions and actions in batched queries."""
     query = "SELECT * FROM rules WHERE 1=1"
     params = []
-    
+
     if domain and domain != "all":
         query += " AND domain = ?"
         params.append(domain)
-    if module and module != "all":
-        query += " AND module = ?"
-        params.append(module)
-        
+
     query += " ORDER BY priority ASC"
     rows = db.execute(query, params).fetchall()
     if not rows:
@@ -94,40 +98,52 @@ def get_rule_by_id(db: sqlite3.Connection, rule_id: str) -> Optional[Dict[str, A
 
 
 def create_rule_entry(db: sqlite3.Connection, rule: RuleModel) -> str:
-    """Inserts a new rule and its conditions/actions atomically into SQLite, then refreshes cache."""
-    new_id = get_next_rule_id(db)
-    try:
-        db.execute(
-            """
-            INSERT INTO rules (rule_id, domain, module, priority, description, reasoning, condition_logic, is_active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [new_id, rule.domain, rule.module, rule.priority, rule.description, rule.reasoning, rule.condition_logic, rule.is_active]
-        )
-        
-        for cond in rule.conditions:
+    """Inserts a new rule and its conditions/actions atomically into SQLite, then refreshes cache.
+
+    Retries on a rare rule_id collision (two near-simultaneous rule creations both computing
+    the same "next id" before either commits) instead of surfacing an opaque IntegrityError.
+    """
+    max_attempts = 5
+    new_id = None
+    for attempt in range(1, max_attempts + 1):
+        new_id = get_next_rule_id(db)
+        try:
             db.execute(
                 """
-                INSERT INTO conditions (rule_id, condition_group, condition_type, value, negate)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO rules (rule_id, domain, priority, description, reasoning, condition_logic, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                [new_id, cond.condition_group, cond.condition_type, cond.value, cond.negate]
+                [new_id, rule.domain, rule.priority, rule.description, rule.reasoning, rule.condition_logic, rule.is_active]
             )
-            
-        for act in rule.actions:
-            db.execute(
-                """
-                INSERT INTO actions (rule_id, action_type, value)
-                VALUES (?, ?, ?)
-                """,
-                [new_id, act.action_type, act.value]
-            )
-        db.commit()
-        refresh_rules_cache()
-        return new_id
-    except Exception as e:
-        db.rollback()
-        raise e
+
+            for cond in rule.conditions:
+                db.execute(
+                    """
+                    INSERT INTO conditions (rule_id, condition_group, condition_type, value, negate)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    [new_id, cond.condition_group, cond.condition_type, cond.value, cond.negate]
+                )
+
+            for act in rule.actions:
+                db.execute(
+                    """
+                    INSERT INTO actions (rule_id, action_type, value)
+                    VALUES (?, ?, ?)
+                    """,
+                    [new_id, act.action_type, act.value]
+                )
+            db.commit()
+            _refresh_rules_everywhere()
+            return new_id
+        except sqlite3.IntegrityError as e:
+            db.rollback()
+            if attempt == max_attempts:
+                raise RuntimeError(f"Could not allocate a unique rule id after {max_attempts} attempts: {e}")
+            continue
+        except Exception as e:
+            db.rollback()
+            raise e
 
 
 def update_rule_entry(db: sqlite3.Connection, rule_id: str, rule: RuleModel) -> bool:
@@ -135,15 +151,15 @@ def update_rule_entry(db: sqlite3.Connection, rule_id: str, rule: RuleModel) -> 
     existing = db.execute("SELECT rule_id FROM rules WHERE rule_id = ?", [rule_id]).fetchone()
     if not existing:
         return False
-        
+
     try:
         db.execute(
             """
             UPDATE rules
-            SET domain = ?, module = ?, priority = ?, description = ?, reasoning = ?, condition_logic = ?, is_active = ?, updated_at = datetime('now')
+            SET domain = ?, priority = ?, description = ?, reasoning = ?, condition_logic = ?, is_active = ?, updated_at = datetime('now')
             WHERE rule_id = ?
             """,
-            [rule.domain, rule.module, rule.priority, rule.description, rule.reasoning, rule.condition_logic, rule.is_active, rule_id]
+            [rule.domain, rule.priority, rule.description, rule.reasoning, rule.condition_logic, rule.is_active, rule_id]
         )
         
         # Clear and replace existing conditions and actions
@@ -168,7 +184,7 @@ def update_rule_entry(db: sqlite3.Connection, rule_id: str, rule: RuleModel) -> 
                 [rule_id, act.action_type, act.value]
             )
         db.commit()
-        refresh_rules_cache()
+        _refresh_rules_everywhere()
         return True
     except Exception as e:
         db.rollback()
@@ -186,7 +202,7 @@ def delete_rule_entry(db: sqlite3.Connection, rule_id: str) -> bool:
         db.execute("DELETE FROM actions WHERE rule_id = ?", [rule_id])
         db.execute("DELETE FROM rules WHERE rule_id = ?", [rule_id])
         db.commit()
-        refresh_rules_cache()
+        _refresh_rules_everywhere()
         return True
     except Exception as e:
         db.rollback()
@@ -205,7 +221,7 @@ def reorder_rules_entries(db: sqlite3.Connection, ordered_ids: List[str]) -> boo
                 [(index + 1) * 10, rule_id]
             )
         db.commit()
-        refresh_rules_cache()
+        _refresh_rules_everywhere()
         return True
     except Exception as e:
         db.rollback()

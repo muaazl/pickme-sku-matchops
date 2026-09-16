@@ -12,7 +12,6 @@ import {
   Chip,
   Tabs,
   Tab,
-  Alert,
   InputAdornment,
   IconButton,
   Dialog,
@@ -34,12 +33,12 @@ import {
 } from '@mui/material';
 import { UploadCloud, FileText, X, Eye, EyeOff, ShieldCheck, Play } from 'lucide-react';
 import { useSnackbar } from 'notistack';
-import { PageContainer, PageHeader } from '../components/ui';
+import { PageContainer, PageHeader, IconModal } from '../components/ui';
 import { DOMAINS } from '../constants';
 import { useMutation } from '@tanstack/react-query';
-import { createBatch } from '../api';
+import { createBatch, merchantFetch } from '../api';
 import { useStore } from '../store';
-import { parseCSV, mapRows } from '../utils/csv';
+import { parseCSV, mapRows, parseExcelWorkbook } from '../utils/csv';
 
 export default function ProcessSKUs() {
   const navigate = useNavigate();
@@ -63,6 +62,13 @@ export default function ProcessSKUs() {
 
   // Paste CSV State
   const [pastedText, setPastedText] = useState('');
+
+  // Bulk Upload State (multiple CSVs and/or a multi-tab Excel workbook, queued together)
+  const [bulkFiles, setBulkFiles] = useState([]);
+  const [bulkDragOver, setBulkDragOver] = useState(false);
+  const bulkInputRef = useRef(null);
+  // Each entry: { id, name, sourceLabel, rows, status: 'pending'|'starting'|'started'|'error', jobId, error }
+  const [pendingJobs, setPendingJobs] = useState(null);
 
   // Merchant Fetch State
   const [localMerchantId, setLocalMerchantId] = useState(merchantId);
@@ -100,7 +106,9 @@ export default function ProcessSKUs() {
     },
   });
 
-  // Client-side fetch from Food Portal
+  // Fetch from the Food Portal — the actual portal call happens server-side (the backend
+  // holds the bearer token only for the duration of this one request; the browser never
+  // talks to the portal directly).
   const fetchCsvFromPortal = async (tokenToUse) => {
     if (!localMerchantId.trim()) {
       enqueueSnackbar('Please enter a Merchant ID', { variant: 'warning' });
@@ -108,64 +116,22 @@ export default function ProcessSKUs() {
     }
 
     setFetchingPortal(true);
-    const baseUrl =
-      import.meta.env.VITE_PORTAL_URL || 'https://food-portal-api-go.pickme.lk/v1/food/place/skus/csv/{merchantid}';
-    const url = baseUrl.replace('{merchantid}', localMerchantId.trim());
-
     try {
-      const response = await fetch(url, {
-        method: 'GET',
-        headers: {
-          Authorization: 'Bearer ' + tokenToUse,
-          'user-action': 'view_restaurant/view',
-        },
+      const data = await merchantFetch({
+        merchant_id: localMerchantId.trim(),
+        bearer_token: tokenToUse,
+        portal_url: localPortalUrl,
+        domain,
+        task,
       });
 
-      const text = await response.text();
-
-      // Try to parse error if it is JSON
-      try {
-        const json = JSON.parse(text);
-        if (json && json.errors) {
-          const isBlacklisted = json.errors.some(
-            (err) =>
-              err.code === 'MER-4007' ||
-              err.code === 'MER-4006' ||
-              (err.message &&
-                (err.message.toLowerCase().includes('token blacklisted') ||
-                  err.message.toLowerCase().includes('token expired')))
-          );
-          if (isBlacklisted) {
-            clearToken();
-            setLocalToken('');
-            enqueueSnackbar(
-              'Your API token has been blacklisted or expired. The bad token has been cleared. Please enter a fresh token.',
-              { variant: 'error' }
-            );
-            setTokenModalOpen(true);
-            setFetchingPortal(false);
-            return;
-          }
-
-          const errorMsg = json.errors.map((e) => e.message || e.code).join(', ');
-          throw new Error(errorMsg || 'Failed to fetch SKUs from portal');
-        }
-      } catch (e) {
-        // Text is not JSON, proceed as CSV
-      }
-
-      if (!response.ok) {
-        throw new Error(`Server returned status ${response.status}: ${response.statusText}`);
-      }
-
-      const parsed = parseCSV(text);
-      if (!parsed.rows || parsed.rows.length === 0) {
+      const rows = data.rows || [];
+      if (rows.length === 0) {
         throw new Error('Fetched CSV has no data');
       }
 
-      const mapped = mapRows(parsed.headers, parsed.rows);
       setPreviewData({
-        rows: mapped,
+        rows,
         source: 'merchant',
         name: localMerchantId.trim(),
         domain,
@@ -173,7 +139,20 @@ export default function ProcessSKUs() {
       });
       setJobName(localMerchantId.trim());
     } catch (err) {
-      enqueueSnackbar(`Portal Fetch Error: ${err.message}`, { variant: 'error' });
+      if (err.response?.status === 401) {
+        // The backend confirmed this token is invalid, blacklisted, or expired — clear it
+        // and ask for a fresh one, rather than only reacting to two specific portal error codes.
+        clearToken();
+        setLocalToken('');
+        enqueueSnackbar(
+          err.response?.data?.detail ||
+            'Your API token is invalid, blacklisted, or expired. The bad token has been cleared. Please enter a fresh token.',
+          { variant: 'error' }
+        );
+        setTokenModalOpen(true);
+      } else {
+        enqueueSnackbar(`Portal Fetch Error: ${err.response?.data?.detail || err.message}`, { variant: 'error' });
+      }
     } finally {
       setFetchingPortal(false);
     }
@@ -265,16 +244,13 @@ export default function ProcessSKUs() {
     }
   };
 
-  const handleStartJob = () => {
-    if (!jobName.trim()) {
-      enqueueSnackbar('Please enter a job name', { variant: 'warning' });
-      return;
-    }
-
+  // Re-serializes normalized rows back into a CSV file for the existing /batches upload
+  // endpoint — shared by the single-job flow and each card in the bulk-upload flow.
+  const rowsToFormData = (rows, name, jobDomain, jobTask) => {
     const csvHeaders = ['name', 'price', 'description', 'category'];
     const csvLines = [csvHeaders.join(',')];
 
-    previewData.rows.forEach((row) => {
+    rows.forEach((row) => {
       const line = csvHeaders.map((header) => {
         let val = String(row[header] || '');
         if (val.includes(',') || val.includes('"') || val.includes('\n') || val.includes('\r')) {
@@ -287,15 +263,147 @@ export default function ProcessSKUs() {
 
     const csvContent = csvLines.join('\n');
     const blob = new Blob([csvContent], { type: 'text/csv' });
-    const fileToUpload = new File([blob], jobName.trim(), { type: 'text/csv' });
+    const fileToUpload = new File([blob], name, { type: 'text/csv' });
 
     const formData = new FormData();
     formData.append('file', fileToUpload);
-    formData.append('domain', previewData.domain);
-    formData.append('task', previewData.task);
+    formData.append('domain', jobDomain);
+    formData.append('task', jobTask);
     formData.append('created_by', 'admin');
+    return formData;
+  };
 
-    createMutation.mutate(formData);
+  const handleStartJob = () => {
+    if (!jobName.trim()) {
+      enqueueSnackbar('Please enter a job name', { variant: 'warning' });
+      return;
+    }
+    createMutation.mutate(rowsToFormData(previewData.rows, jobName.trim(), previewData.domain, previewData.task));
+  };
+
+  // --- Bulk Upload (multiple CSVs and/or a multi-tab Excel workbook) ---
+
+  const SUPPORTED_BULK_EXTS = ['.csv', '.tsv', '.txt', '.xlsx', '.xls'];
+
+  const pickBulkFiles = (fileList) => {
+    const incoming = Array.from(fileList || []);
+    if (incoming.length === 0) return;
+    const valid = incoming.filter((f) => SUPPORTED_BULK_EXTS.some((ext) => f.name.toLowerCase().endsWith(ext)));
+    if (valid.length === 0) {
+      enqueueSnackbar('Please choose CSV, TSV, or Excel (.xlsx/.xls) files', { variant: 'warning' });
+      return;
+    }
+    if (valid.length < incoming.length) {
+      enqueueSnackbar(`${incoming.length - valid.length} file(s) skipped (unsupported type)`, { variant: 'warning' });
+    }
+    setBulkFiles((prev) => [...prev, ...valid]);
+  };
+
+  const onBulkDrop = (e) => {
+    e.preventDefault();
+    setBulkDragOver(false);
+    pickBulkFiles(e.dataTransfer.files);
+  };
+
+  const readFileAsText = (f) =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (e) => resolve(e.target.result);
+      reader.onerror = () => reject(reader.error);
+      reader.readAsText(f);
+    });
+
+  const readFileAsArrayBuffer = (f) =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (e) => resolve(e.target.result);
+      reader.onerror = () => reject(reader.error);
+      reader.readAsArrayBuffer(f);
+    });
+
+  const handleBulkConfirm = async () => {
+    if (bulkFiles.length === 0) {
+      enqueueSnackbar('Please add at least one file', { variant: 'warning' });
+      return;
+    }
+
+    const jobs = [];
+    for (const f of bulkFiles) {
+      const lower = f.name.toLowerCase();
+      const baseName = f.name.replace(/\.[^/.]+$/, '');
+      try {
+        if (lower.endsWith('.xlsx') || lower.endsWith('.xls')) {
+          const buf = await readFileAsArrayBuffer(f);
+          const sheets = parseExcelWorkbook(buf);
+          const sheetNames = Object.keys(sheets);
+          if (sheetNames.length === 0) {
+            jobs.push({ id: `${f.name}::empty`, name: baseName, sourceLabel: f.name, rows: [], status: 'error', jobId: null, error: 'No data found in any sheet.' });
+            continue;
+          }
+          sheetNames.forEach((sheetName) => {
+            const { headers, rows } = sheets[sheetName];
+            const mapped = mapRows(headers, rows);
+            const multi = sheetNames.length > 1;
+            jobs.push({
+              id: `${f.name}::${sheetName}`,
+              name: multi ? `${baseName} - ${sheetName}` : baseName,
+              sourceLabel: multi ? `${f.name} / ${sheetName}` : f.name,
+              rows: mapped,
+              status: 'pending',
+              jobId: null,
+              error: null,
+            });
+          });
+        } else {
+          const text = await readFileAsText(f);
+          const parsed = parseCSV(text);
+          const mapped = mapRows(parsed.headers, parsed.rows);
+          jobs.push({
+            id: f.name,
+            name: baseName,
+            sourceLabel: f.name,
+            rows: mapped,
+            status: mapped.length > 0 ? 'pending' : 'error',
+            jobId: null,
+            error: mapped.length > 0 ? null : 'No data rows found.',
+          });
+        }
+      } catch (err) {
+        jobs.push({ id: f.name, name: baseName, sourceLabel: f.name, rows: [], status: 'error', jobId: null, error: err.message });
+      }
+    }
+
+    setPendingJobs(jobs);
+    setCsvModalOpen(false);
+    setBulkFiles([]);
+  };
+
+  const updatePendingJob = (id, patch) => {
+    setPendingJobs((prev) => (prev ? prev.map((j) => (j.id === id ? { ...j, ...patch } : j)) : prev));
+  };
+
+  const startPendingJob = async (job) => {
+    if (job.status === 'starting' || job.status === 'started') return;
+    updatePendingJob(job.id, { status: 'starting', error: null });
+    try {
+      const data = await createBatch(rowsToFormData(job.rows, job.name.trim() || job.id, domain, task));
+      updatePendingJob(job.id, { status: 'started', jobId: data.job_id });
+    } catch (err) {
+      updatePendingJob(job.id, { status: 'error', error: err.response?.data?.detail || err.message });
+    }
+  };
+
+  const startAllPendingJobs = () => {
+    (pendingJobs || []).forEach((job) => {
+      if (job.status === 'pending' || job.status === 'error') startPendingJob(job);
+    });
+  };
+
+  const removePendingJob = (id) => {
+    setPendingJobs((prev) => {
+      const next = (prev || []).filter((j) => j.id !== id);
+      return next.length > 0 ? next : null;
+    });
   };
 
   const handleTokenSubmit = () => {
@@ -306,7 +414,92 @@ export default function ProcessSKUs() {
 
   const canSubmitMerchant = localMerchantId.trim() !== '';
 
-  const canSubmitCsv = uploadMode === 'file' ? file !== null : pastedText.trim().length > 0;
+  const canSubmitCsv =
+    uploadMode === 'file'
+      ? file !== null
+      : uploadMode === 'bulk'
+        ? bulkFiles.length > 0
+        : pastedText.trim().length > 0;
+
+  // Render bulk-upload queue (multiple CSVs / Excel tabs) if pendingJobs is set
+  if (pendingJobs) {
+    const anyPending = pendingJobs.some((j) => j.status === 'pending' || j.status === 'error');
+    return (
+      <PageContainer>
+        <PageHeader
+          title="Bulk SKU Jobs"
+          subtitle="Review each file/sheet below, then start them individually or all at once."
+        />
+
+        <Stack spacing={2} sx={{ mt: 3 }}>
+          {pendingJobs.map((job) => (
+            <Card key={job.id} variant="outlined">
+              <CardContent>
+                <Stack direction="row" spacing={2} alignItems="center" flexWrap="wrap" useFlexGap>
+                  <Box sx={{ flexGrow: 1, minWidth: 200 }}>
+                    <TextField
+                      value={job.name}
+                      onChange={(e) => updatePendingJob(job.id, { name: e.target.value })}
+                      label="Job name"
+                      size="small"
+                      fullWidth
+                      disabled={job.status === 'starting' || job.status === 'started'}
+                    />
+                    <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
+                      {job.sourceLabel} · {job.rows.length} SKU{job.rows.length === 1 ? '' : 's'}
+                    </Typography>
+                  </Box>
+
+                  {job.status === 'started' ? (
+                    <Chip label={`Queued — Job ${job.jobId}`} color="success" size="small" />
+                  ) : job.status === 'error' ? (
+                    <Chip label={job.error || 'Failed'} color="error" size="small" sx={{ maxWidth: 320 }} />
+                  ) : job.status === 'starting' ? (
+                    <Chip
+                      icon={<CircularProgress size={12} color="inherit" />}
+                      label="Starting…"
+                      size="small"
+                    />
+                  ) : job.rows.length === 0 ? (
+                    <Chip label="No rows" color="warning" size="small" />
+                  ) : null}
+
+                  <Stack direction="row" spacing={1}>
+                    <Button
+                      size="small"
+                      variant="contained"
+                      disabled={job.status === 'starting' || job.status === 'started' || job.rows.length === 0}
+                      onClick={() => startPendingJob(job)}
+                    >
+                      {job.status === 'error' ? 'Retry' : 'Start'}
+                    </Button>
+                    <Button
+                      size="small"
+                      color="inherit"
+                      variant="outlined"
+                      disabled={job.status === 'starting'}
+                      onClick={() => removePendingJob(job.id)}
+                    >
+                      {job.status === 'started' ? 'Dismiss' : 'Remove'}
+                    </Button>
+                  </Stack>
+                </Stack>
+              </CardContent>
+            </Card>
+          ))}
+
+          <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 1.5, pt: 1 }}>
+            <Button color="inherit" onClick={() => navigate('/jobs')}>
+              Done
+            </Button>
+            <Button variant="contained" disabled={!anyPending} onClick={startAllPendingJobs}>
+              Start All
+            </Button>
+          </Box>
+        </Stack>
+      </PageContainer>
+    );
+  }
 
   // Render Table Preview Confirmation UI if previewData is set
   if (previewData) {
@@ -561,7 +754,8 @@ export default function ProcessSKUs() {
               Have a CSV to process?
             </Typography>
             <Typography variant="body2" color="text.secondary" sx={{ mb: 3, maxWidth: 360 }}>
-              You can upload a CSV file or paste raw rows directly to match, classify, or execute pipelines.
+              Upload a CSV, paste raw rows, or queue multiple CSVs / an Excel workbook at once
+              via Bulk Upload — to match, classify, or execute pipelines.
             </Typography>
 
             {file ? (
@@ -618,6 +812,7 @@ export default function ProcessSKUs() {
           >
             <Tab label="File Upload" value="file" />
             <Tab label="Paste CSV" value="paste" />
+            <Tab label="Bulk Upload" value="bulk" />
           </Tabs>
 
           {uploadMode === 'file' && (
@@ -682,6 +877,62 @@ export default function ProcessSKUs() {
             </Box>
           )}
 
+          {uploadMode === 'bulk' && (
+            <Box sx={{ mb: 3 }}>
+              <Box
+                onClick={() => bulkInputRef.current?.click()}
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  setBulkDragOver(true);
+                }}
+                onDragLeave={() => setBulkDragOver(false)}
+                onDrop={onBulkDrop}
+                sx={{
+                  border: (t) => `2px dashed ${bulkDragOver ? t.palette.primary.main : t.palette.divider}`,
+                  borderRadius: 2,
+                  p: 5,
+                  textAlign: 'center',
+                  cursor: 'pointer',
+                  transition: 'all .15s',
+                  bgcolor: (t) => (bulkDragOver ? t.palette.action.hover : 'transparent'),
+                }}
+              >
+                <input
+                  ref={bulkInputRef}
+                  type="file"
+                  accept=".csv,.tsv,.txt,.xlsx,.xls"
+                  multiple
+                  hidden
+                  onChange={(e) => {
+                    pickBulkFiles(e.target.files);
+                    e.target.value = '';
+                  }}
+                />
+                <UploadCloud size={40} style={{ opacity: 0.6 }} />
+                <Typography variant="subtitle1" sx={{ mt: 1 }}>
+                  Drag & drop multiple CSVs, or one Excel workbook
+                </Typography>
+                <Typography variant="body2" color="text.secondary">
+                  Each CSV becomes one job; each tab of an Excel workbook becomes its own job
+                </Typography>
+              </Box>
+
+              {bulkFiles.length > 0 && (
+                <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap sx={{ mt: 2 }}>
+                  {bulkFiles.map((f, idx) => (
+                    <Chip
+                      key={`${f.name}-${idx}`}
+                      icon={<FileText size={15} />}
+                      label={`${f.name} · ${(f.size / 1024).toFixed(1)} KB`}
+                      onDelete={() => setBulkFiles((prev) => prev.filter((_, i) => i !== idx))}
+                      deleteIcon={<X size={15} />}
+                    />
+                  ))}
+                </Stack>
+              )}
+            </Box>
+          )}
+
           <Stack spacing={2.5} sx={{ mt: 2 }}>
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
               <Typography variant="caption" color="text.secondary" sx={{ fontWeight: 600 }}>
@@ -722,54 +973,60 @@ export default function ProcessSKUs() {
           <Button
             variant="contained"
             disabled={!canSubmitCsv || createMutation.isPending}
-            onClick={handleCsvModalConfirm}
+            onClick={uploadMode === 'bulk' ? handleBulkConfirm : handleCsvModalConfirm}
             sx={{ px: 4 }}
           >
-            {createMutation.isPending ? 'Processing…' : 'Process CSV'}
+            {createMutation.isPending
+              ? 'Processing…'
+              : uploadMode === 'bulk'
+                ? `Review ${bulkFiles.length || ''} File${bulkFiles.length === 1 ? '' : 's'}`
+                : 'Process CSV'}
           </Button>
         </DialogActions>
       </Dialog>
 
-      {/* Bearer Token Dialog */}
-      <Dialog open={tokenModalOpen} onClose={() => setTokenModalOpen(false)} maxWidth="sm" fullWidth>
-        <DialogTitle>Enter Bearer Token</DialogTitle>
-        <DialogContent>
-          <Alert severity="info" icon={<ShieldCheck size={20} />} sx={{ mb: 3, mt: 1 }}>
-            The bearer token is kept in memory only — it is never stored or logged.
-          </Alert>
-          <TextField
-            autoFocus
-            label="Bearer token"
-            type={showToken ? 'text' : 'password'}
-            value={localToken}
-            onChange={(e) => setLocalToken(e.target.value)}
-            placeholder="••••••••••••"
-            fullWidth
-            InputProps={{
-              endAdornment: (
-                <InputAdornment position="end">
-                  <IconButton
-                    onClick={() => setShowToken((s) => !s)}
-                    edge="end"
-                    size="small"
-                    aria-label="Toggle token visibility"
-                  >
-                    {showToken ? <EyeOff size={17} /> : <Eye size={17} />}
-                  </IconButton>
-                </InputAdornment>
-              ),
-            }}
-          />
-        </DialogContent>
-        <DialogActions sx={{ p: 2, pt: 0 }}>
-          <Button onClick={() => setTokenModalOpen(false)} color="inherit">
-            Cancel
-          </Button>
-          <Button variant="contained" onClick={handleTokenSubmit} disabled={!localToken.trim()}>
-            Confirm & Fetch
-          </Button>
-        </DialogActions>
-      </Dialog>
+      {/* Bearer Token Modal */}
+      <IconModal
+        open={tokenModalOpen}
+        onClose={() => setTokenModalOpen(false)}
+        icon={ShieldCheck}
+        title="Enter Bearer Token"
+        description="The bearer token is kept only for this browser tab's session (never written to disk) and is cleared automatically when you close the tab, or immediately if the portal reports it as invalid, blacklisted, or expired."
+        actions={
+          <>
+            <Button onClick={() => setTokenModalOpen(false)} color="inherit" variant="outlined" fullWidth>
+              Cancel
+            </Button>
+            <Button variant="contained" fullWidth onClick={handleTokenSubmit} disabled={!localToken.trim()}>
+              Confirm & Fetch
+            </Button>
+          </>
+        }
+      >
+        <TextField
+          autoFocus
+          label="Bearer token"
+          type={showToken ? 'text' : 'password'}
+          value={localToken}
+          onChange={(e) => setLocalToken(e.target.value)}
+          placeholder="••••••••••••"
+          fullWidth
+          InputProps={{
+            endAdornment: (
+              <InputAdornment position="end">
+                <IconButton
+                  onClick={() => setShowToken((s) => !s)}
+                  edge="end"
+                  size="small"
+                  aria-label="Toggle token visibility"
+                >
+                  {showToken ? <EyeOff size={17} /> : <Eye size={17} />}
+                </IconButton>
+              </InputAdornment>
+            ),
+          }}
+        />
+      </IconModal>
     </PageContainer>
   );
 }

@@ -10,14 +10,15 @@ from tqdm import tqdm
 
 from engine import config
 from engine.nlp.text_cleaner import TextPipeline
-from engine.utils.flavor_utils import build_food_flavors_info
+from engine.utils.flavor_utils import build_food_flavors_info, triage_input_flavors
+from engine.utils.weight_utils import resolve_weight_bypass_candidate
 
 logger = logging.getLogger("matchops.matcher")
 
 class SKUMatcher:
     """Main SKU matching pipeline orchestrator."""
 
-    def __init__(self, catalog_df: pd.DataFrame, brands_df: pd.DataFrame, ner_engine, embed_engine, cache_manager, logic_gates, domain: str = config.DOMAIN_MARKET, classifier=None):
+    def __init__(self, catalog_df: pd.DataFrame, brands_df: pd.DataFrame, ner_engine, embed_engine, cache_manager, logic_gates, domain: str = config.DOMAIN_MARKET, classifier=None, check_for_updates: bool = False, force_sync: bool = False):
         self.ner = ner_engine
         self.embedder = embed_engine
         self.rules = logic_gates
@@ -81,7 +82,9 @@ class SKUMatcher:
             self._specific_flavor_pattern = None
 
         # Sync catalog with cache and vector store
-        self.raw_catalog, self.vector_store = cache_manager.manage_catalog_cache(catalog_df, brands_df, domain=domain)
+        self.raw_catalog, self.vector_store = cache_manager.manage_catalog_cache(
+            catalog_df, brands_df, domain=domain, check_for_updates=check_for_updates, force_sync=force_sync
+        )
         self.raw_catalog = self.raw_catalog.reset_index(drop=True)
 
         # Build lookup maps for fast O(1) exact matching and O(1) token-sort fuzzy bypass
@@ -181,7 +184,7 @@ class SKUMatcher:
             # Exact text match lookup
             cat_idx = self.exact_match_map.get(clean_input)
             if cat_idx is not None:
-                bypass_results[i] = (self.raw_catalog.iloc[cat_idx], 100.0, "High Confidence", "Exact Text Match")
+                bypass_results[i] = (self.raw_catalog.iloc[cat_idx], 1.0, "High Confidence", "Exact Text Match")
                 continue
 
             # Early fuzzy search on weight-stripped text (O(1) Hash Map Optimization)
@@ -192,41 +195,10 @@ class SKUMatcher:
                 if isinstance(cand_indices, int):
                     cand_indices = [cand_indices]
 
-                selected_idx = cand_indices[0]
-                weight_reason = ""
-                combined_score = 100.0
-
-                if input_w_data[0] is not None:
-                    in_val, _, in_type = input_w_data
-                    best_match_idx = None
-                    min_diff_pct = float("inf")
-
-                    for c_idx in cand_indices:
-                        cat_row = self.raw_catalog.iloc[c_idx]
-                        catalog_w_data = cat_row.get("weight_val")
-                        if catalog_w_data is not None and isinstance(catalog_w_data, (tuple, list)) and catalog_w_data[0] is not None:
-                            cat_val, _, cat_type = catalog_w_data
-                            if in_type == cat_type:
-                                max_val = max(in_val, cat_val)
-                                diff_pct = abs(in_val - cat_val) / max_val * 100 if max_val > 0 else 0
-                                if diff_pct < min_diff_pct:
-                                    min_diff_pct = diff_pct
-                                    best_match_idx = c_idx
-
-                    if best_match_idx is not None:
-                        selected_idx = best_match_idx
-                        cat_row = self.raw_catalog.iloc[selected_idx]
-                        catalog_w_data = cat_row.get("weight_val")
-                        cat_val = catalog_w_data[0]
-                        if min_diff_pct < 1.0:
-                            weight_reason = f" | Weight Match ({int(in_val)})"
-                        else:
-                            weight_reason = f" | Weight Mismatch ({int(in_val)} vs {int(cat_val)})"
-                    else:
-                        cat_row = self.raw_catalog.iloc[selected_idx]
-                        catalog_w_data = cat_row.get("weight_val")
-                        if catalog_w_data is not None and isinstance(catalog_w_data, (tuple, list)) and catalog_w_data[0] is not None:
-                            weight_reason = f" | Weight Mismatch ({int(in_val)} vs {int(catalog_w_data[0])})"
+                combined_score = 1.0
+                selected_idx, weight_reason = resolve_weight_bypass_candidate(
+                    self.raw_catalog, cand_indices, input_w_data
+                )
 
                 best_reason = f"Fuzzy Match (100%){weight_reason}"
                 bypass_results[i] = (self.raw_catalog.iloc[selected_idx], combined_score, "High Confidence", best_reason)
@@ -258,11 +230,7 @@ class SKUMatcher:
         for i in range(len(raw_names)):
             i_desc = str(input_df.iloc[i].get("Description", input_df.iloc[i].get("description", "")))
             i_cat = str(input_df.iloc[i].get("Category", input_df.iloc[i].get("category", "")))
-            full_txt = raw_names[i]
-            if i_desc and i_desc.lower() not in ("nan", "none", "<na>"):
-                full_txt += f" {i_desc}"
-            if i_cat and i_cat.lower() not in ("nan", "none", "<na>"):
-                full_txt += f" {i_cat}"
+            full_txt = TextPipeline.build_ner_input(raw_names[i], i_desc, i_cat)
             all_ner_texts.append(TextPipeline.prep_for_ner(full_txt))
 
         if self.ner and all_ner_texts:
@@ -288,7 +256,7 @@ class SKUMatcher:
             for list_idx, ai_idx in enumerate(ai_indices):
                 if bt_preds[list_idx]:
                     bt_tag, confidence, source = bt_preds[list_idx]
-                    threshold = 0.40 if source == "zero-shot" else 0.50
+                    threshold = config.get_bt_confidence_threshold(source)
                     if confidence >= threshold:
                         bt_filters[ai_idx] = bt_tag
 
@@ -429,6 +397,11 @@ class SKUMatcher:
             if progress_callback:
                 progress_callback(75.0 + (((i + 1) / len(raw_names)) * 25.0), f"Matching {i + 1} of {len(raw_names)}...")
 
+            best_match_row_fallback = None
+            final_score_fallback = -10.0
+            status_fallback = "Rejected"
+            reasons_fallback = ""
+
             raw_input, clean_input, input_no_weights = raw_names[i], clean_inputs[i], input_no_weights_list[i]
             row_data = input_df.iloc[i]
             current_input_price = prices[i]
@@ -506,12 +479,21 @@ class SKUMatcher:
                         candidates_unfiltered = candidates_unfiltered.drop_duplicates(subset=["clean_text"])
                     
                     if candidates_unfiltered.empty:
-                        if 'best_match_row_fallback' in locals():
+                        if best_match_row_fallback is not None:
                             best_match_row = best_match_row_fallback
                             final_score = final_score_fallback
                             status = status_fallback
                             reasons = reasons_fallback
                         else:
+                            results.append({
+                                "Input Raw": raw_input, "Matched Catalog Name": "",
+                                "Final Score": 0.0, "Status": "Low / Rejected", "Logic Notes": "No candidates found",
+                                "BasicType": "",
+                                "GenericKeywords": "",
+                                "Categories": "",
+                                "Region": "",
+                                "Input Entities": input_entities, "Catalog Entities": {}
+                            })
                             continue
                     else:
                         candidates_unfiltered = score_candidate_df(candidates_unfiltered, i, clean_input, input_entities)
@@ -547,7 +529,7 @@ class SKUMatcher:
                                 reasons_uf = uf_reasons
                                 best_cand_score_uf = cand_score
 
-                        if 'best_match_row_fallback' in locals() and final_score_fallback > final_score_uf:
+                        if best_match_row_fallback is not None and final_score_fallback > final_score_uf:
                             best_match_row = best_match_row_fallback
                             final_score = final_score_fallback
                             status = status_fallback
@@ -565,20 +547,10 @@ class SKUMatcher:
             match_gk = best_match_row.get("Generic keywords", "")
             if self.domain == config.DOMAIN_FOOD and getattr(self, "flavor_categories", None):
                 # 1. Resolve input flavors
-                input_flavors = set()
-                if input_entities and isinstance(input_entities, dict):
-                    input_flavors.update(x.lower() for x in input_entities.get("flavor", set()) if x)
-                # Fallback to matched catalog entities if input_entities is empty/None (e.g. for exact match bypass)
-                if not input_flavors:
-                    cat_ents = best_match_row.get("entities")
-                    if isinstance(cat_ents, dict):
-                        input_flavors.update(x.lower() for x in cat_ents.get("flavor", set()) if x)
-                resolved_input_flavors = self.rules._resolve_flavors(input_flavors) if hasattr(self.rules, "_resolve_flavors") else input_flavors
-                
-                input_meats = {f for f in resolved_input_flavors if self.flavor_categories.get(f, (False, False, False))[0] and not self.flavor_categories.get(f, (False, False, False))[2]}
-                input_seafoods = {f for f in resolved_input_flavors if self.flavor_categories.get(f, (False, False, False))[2]}
-                input_vegs = {f for f in resolved_input_flavors if self.flavor_categories.get(f, (False, False, False))[1]}
-                
+                input_meats, input_seafoods, input_vegs = triage_input_flavors(
+                    self.rules, self.flavor_categories, input_entities, best_match_row
+                )
+
                 if match_gk:
                     kws = [k.strip() for k in str(match_gk).split(",") if k.strip()]
                     filtered_kws = []

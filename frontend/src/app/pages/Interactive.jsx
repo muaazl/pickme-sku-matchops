@@ -29,7 +29,8 @@ import { runInteractiveSingle, getTemplateSuggestions, runInteractiveAudit } fro
 import AuditTelemetryView from './interactive/AuditTelemetryView';
 
 function Confidence({ label, value, status, source }) {
-  const num = typeof value === 'number' ? value : 0;
+  const parsed = typeof value === 'number' ? value : Number(value);
+  const num = Number.isFinite(parsed) ? parsed : 0;
   const normalized = num > 1 ? num / 100 : num;
   const pct = Math.round(Math.max(0, Math.min(1, normalized)) * 100);
   return (
@@ -188,7 +189,7 @@ export default function Interactive() {
                   value={sku}
                   onChange={(e) => setSku(e.target.value)}
                   fullWidth
-                  onKeyDown={(e) => e.key === 'Enter' && run()}
+                  onKeyDown={(e) => e.key === 'Enter' && !loading && run()}
                 />
                 <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
                   <TextField label="Price" value={price} onChange={(e) => setPrice(e.target.value)} fullWidth />

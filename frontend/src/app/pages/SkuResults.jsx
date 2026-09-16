@@ -405,7 +405,8 @@ export default function SkuResults() {
   // -------------------------
   // SKUS VIEW (FOR SELECTED JOB)
   // -------------------------
-  const colSpan = selectedJob.domain === 'all' ? 6 : 5;
+  // Always 4: SKU Name + Generic Keywords + Basic Type + exactly one of Categories/Region.
+  const colSpan = 4;
   const isClassifier = selectedJob.task?.toLowerCase() === 'classifier';
   const isMatcher = selectedJob.task?.toLowerCase() === 'matcher';
 
@@ -630,6 +631,35 @@ export default function SkuResults() {
                   </Typography>
                 </Box>
               ))}
+
+            {(selectedSku.input_price != null ||
+              selectedSku.input_description ||
+              selectedSku.input_category) && (
+              <>
+                <Typography variant="subtitle2" sx={{ mt: 2, mb: 1 }}>
+                  Input Details
+                </Typography>
+                {[
+                  [
+                    'Price',
+                    selectedSku.input_price != null ? Number(selectedSku.input_price).toFixed(2) : null,
+                  ],
+                  ['Description', selectedSku.input_description],
+                  ['Category', selectedSku.input_category],
+                ]
+                  .filter(([, v]) => v !== null && v !== undefined && v !== '')
+                  .map(([k, v]) => (
+                    <Box key={k} sx={{ display: 'flex', justifyContent: 'space-between', py: 0.7 }}>
+                      <Typography variant="body2" color="text.secondary">
+                        {k}
+                      </Typography>
+                      <Typography variant="body2" sx={{ fontWeight: 500, textAlign: 'right', maxWidth: '70%' }}>
+                        {v}
+                      </Typography>
+                    </Box>
+                  ))}
+              </>
+            )}
 
             <Typography variant="subtitle2" sx={{ mt: 2, mb: 1 }}>
               Audit Details

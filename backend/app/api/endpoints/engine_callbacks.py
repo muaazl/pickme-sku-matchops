@@ -59,8 +59,9 @@ def update_progress(job_id: str, payload: JobProgressPayload):
     if last_stage != payload.current_stage:
         _job_stage[j_id] = payload.current_stage
         try:
-            conn = sqlite3.connect(DB_PATH)
+            conn = sqlite3.connect(DB_PATH, timeout=60.0)
             conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout=60000;")
             conn.execute(
                 "UPDATE jobs SET status = 'running', current_stage = ?, updated_at = datetime('now') WHERE id = ?",
                 (payload.current_stage, j_id)
@@ -81,8 +82,9 @@ def complete_job(job_id: str, payload: JobCompletePayload):
     _job_eta[j_id] = 0
 
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=60.0)
         conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=60000;")
 
         # Fetch job metadata to get domain and task
         job_row = conn.execute("SELECT domain, type FROM jobs WHERE id = ?", (j_id,)).fetchone()
@@ -102,7 +104,11 @@ def complete_job(job_id: str, payload: JobCompletePayload):
         res_list = payload.results
 
         for i, res in enumerate(res_list):
-            sku_name = input_skus[i].get("name", "") if i < len(input_skus) else ""
+            input_sku = input_skus[i] if i < len(input_skus) else {}
+            sku_name = input_sku.get("name", "")
+            input_price = input_sku.get("price")
+            input_description = input_sku.get("description") or ""
+            input_category = input_sku.get("category") or ""
             logic_notes = res.get("logic_notes", "")
             matched_catalog_name = res.get("matched_catalog_name", "")
             match_score = res.get("score", 0.0)
@@ -148,7 +154,8 @@ def complete_job(job_id: str, payload: JobCompletePayload):
                 json.dumps(gk_val) if gk_val else "[]",
                 region, conf, source, rules, logic_notes,
                 matched_catalog_name, match_score, bt_confidence,
-                gk_confidence, region_confidence
+                gk_confidence, region_confidence,
+                input_price, input_description, input_category
             ))
 
         if sku_rows:
@@ -158,8 +165,9 @@ def complete_job(job_id: str, payload: JobCompletePayload):
                     id, batch_id, sku_name, domain, bt, gk_json, region,
                     confidence, match_source, rules_applied_json, logic_notes,
                     matched_catalog_name, match_score, bt_confidence,
-                    gk_confidence, region_confidence
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    gk_confidence, region_confidence,
+                    input_price, input_description, input_category
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 sku_rows
             )
@@ -180,6 +188,12 @@ def complete_job(job_id: str, payload: JobCompletePayload):
             """,
             (len(res_list), payload.duration_minutes, payload.high_conf, payload.med_conf, payload.low_conf, payload.match_rate, j_id)
         )
+        # Mirror the terminal status onto the batches row, if this job originated from one
+        # (CSV upload/merchant fetch) — a no-op UPDATE for jobs with no corresponding batch.
+        conn.execute(
+            "UPDATE batches SET status = 'completed', completed_at = datetime('now') WHERE id = ?",
+            (j_id,)
+        )
         conn.commit()
         conn.close()
         logger.info(f"Successfully recorded completion for job {job_id} ({len(sku_rows)} SKUs saved).")
@@ -197,8 +211,9 @@ def fail_job(job_id: str, payload: JobFailPayload):
     _job_eta[j_id] = None
 
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=60.0)
         conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=60000;")
         conn.execute(
             """
             UPDATE jobs SET
@@ -210,6 +225,10 @@ def fail_job(job_id: str, payload: JobFailPayload):
             WHERE id = ?
             """,
             (payload.error_message, payload.duration_minutes, j_id)
+        )
+        conn.execute(
+            "UPDATE batches SET status = 'failed', completed_at = datetime('now') WHERE id = ?",
+            (j_id,)
         )
         conn.commit()
         conn.close()

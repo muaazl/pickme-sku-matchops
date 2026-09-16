@@ -15,6 +15,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from engine.processor import process_request
+from engine.db import log_outbound_request
 
 logger = logging.getLogger("matchops.engine.worker")
 
@@ -23,9 +24,17 @@ _cancelled_jobs: Set[str] = set()
 _running_jobs: Dict[str, Dict[str, Any]] = {}
 _worker_thread: Optional[threading.Thread] = None
 
-# Persistent HTTP session with connection pooling
+# Persistent HTTP session with connection pooling.
+# allowed_methods must explicitly include POST: urllib3's default excludes it (only
+# idempotent verbs retry out of the box), and every call this session makes is a POST
+# (progress/complete/fail callbacks to the backend, and the Google Sheets webhook).
 _http_session = requests.Session()
-_retries = Retry(total=1, backoff_factor=0.1, status_forcelist=[502, 503, 504])
+_retries = Retry(
+    total=1,
+    backoff_factor=0.1,
+    status_forcelist=[502, 503, 504],
+    allowed_methods=["GET", "POST"],
+)
 _http_session.mount("http://", HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=_retries))
 _http_session.mount("https://", HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=_retries))
 
@@ -183,12 +192,33 @@ def _worker_loop():
 
             # Post direct Google Sheets callback if provided
             if callback_url:
+                t0_cb = time.time()
                 try:
                     logger.info(f"[ENGINE WORKER] Delivering Google Sheets callback to {callback_url}...")
                     cb_resp = _http_session.post(callback_url, json=result_payload, timeout=120)
-                    logger.info(f"[ENGINE WORKER] Callback responded with status {cb_resp.status_code}")
+                    cb_dur = int((time.time() - t0_cb) * 1000)
+                    logger.info(f"[ENGINE WORKER] Callback responded with status {cb_resp.status_code} in {cb_dur}ms")
+                    log_outbound_request(
+                        url=callback_url,
+                        method="POST",
+                        payload=result_payload,
+                        response_status=cb_resp.status_code,
+                        response_text=cb_resp.text[:10000] if cb_resp.text else "",
+                        duration_ms=cb_dur,
+                        path="/doPost"
+                    )
                 except Exception as cb_err:
+                    cb_dur = int((time.time() - t0_cb) * 1000)
                     logger.error(f"[ENGINE WORKER] Google Sheets callback delivery failed: {cb_err}")
+                    log_outbound_request(
+                        url=callback_url,
+                        method="POST",
+                        payload=result_payload,
+                        response_status=500,
+                        response_text=str(cb_err),
+                        duration_ms=cb_dur,
+                        path="/doPost"
+                    )
 
         except InterruptedError:
             logger.info(f"[ENGINE WORKER] Job {job_id} cancelled successfully.")
@@ -224,10 +254,30 @@ def _worker_loop():
                     "spreadsheet_id": spreadsheet_id,
                     "task": task
                 }
+                t0_cb = time.time()
                 try:
-                    _http_session.post(callback_url, json=err_payload, timeout=30)
-                except Exception:
-                    pass
+                    cb_resp = _http_session.post(callback_url, json=err_payload, timeout=30)
+                    cb_dur = int((time.time() - t0_cb) * 1000)
+                    log_outbound_request(
+                        url=callback_url,
+                        method="POST",
+                        payload=err_payload,
+                        response_status=cb_resp.status_code,
+                        response_text=cb_resp.text[:10000] if cb_resp.text else "",
+                        duration_ms=cb_dur,
+                        path="/doPost"
+                    )
+                except Exception as cb_err:
+                    cb_dur = int((time.time() - t0_cb) * 1000)
+                    log_outbound_request(
+                        url=callback_url,
+                        method="POST",
+                        payload=err_payload,
+                        response_status=500,
+                        response_text=str(cb_err),
+                        duration_ms=cb_dur,
+                        path="/doPost"
+                    )
 
         finally:
             _batch_queue.task_done()

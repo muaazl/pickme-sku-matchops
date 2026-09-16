@@ -4,6 +4,7 @@ SKU MatchOps – FastAPI Application Entry Point (Lightweight API Gateway)
 
 import logging
 import os
+import sqlite3
 import sys
 import threading
 import warnings
@@ -18,6 +19,7 @@ from backend.app.services.meilisearch_service import check_and_sync_meilisearch
 from backend.scripts.migrate_db import migrate
 from engine import config
 from engine.rules_engine import refresh_rules_cache
+from engine.rules_engine.db.seed_rules import DB_PATH
 
 # Configure logging with standard stream and file handlers
 LOG_DIR = config.DB_DIR
@@ -51,8 +53,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "https://sku-matchops.vercel.app"],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "If-None-Match", "X-API-Key"],
 )
 app.add_middleware(AuditLoggingMiddleware)
 app.add_middleware(ETagMiddleware)
@@ -76,6 +78,39 @@ def startup_event():
         refresh_rules_cache()
     except Exception as e:
         logger.warning(f"Failed to refresh rules cache on startup: {e}")
+
+    # Jobs left in 'queued'/'running' state belong to in-memory queue/progress state that
+    # doesn't survive a restart of the backend or the engine. Without this, such a job would
+    # sit stuck in that state forever with no progress updates ever arriving again. Flip them
+    # to 'failed' with a clear message so they show up as actionable — the existing "Retry"
+    # button re-submits them from their stored input SKUs.
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=60.0)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=60000;")
+        cur = conn.execute(
+            """
+            UPDATE jobs SET
+                status = 'failed',
+                current_stage = 'failed',
+                error_message = 'Interrupted by a service restart. Use Retry to resubmit.',
+                completed_at = datetime('now')
+            WHERE status IN ('queued', 'running')
+            """
+        )
+        stuck_count = cur.rowcount
+        conn.execute(
+            """
+            UPDATE batches SET status = 'failed', completed_at = datetime('now')
+            WHERE status IN ('queued', 'running')
+            """
+        )
+        conn.commit()
+        conn.close()
+        if stuck_count:
+            logger.warning(f"Marked {stuck_count} job(s) left in queued/running state as failed after restart.")
+    except Exception as e:
+        logger.error(f"Failed to reconcile stuck jobs on startup: {e}")
 
     # Start Meilisearch verification and sync in a background daemon thread
     try:

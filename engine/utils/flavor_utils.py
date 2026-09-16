@@ -1,5 +1,33 @@
 import pandas as pd
-from typing import Dict, Set, Tuple
+from typing import Dict, Optional, Set, Tuple
+
+def triage_input_flavors(
+    rules,
+    flavor_categories: Dict[str, Tuple[bool, bool, bool]],
+    extracted_entities: Optional[dict],
+    matched_row,
+) -> Tuple[Set[str], Set[str], Set[str]]:
+    """
+    Resolves the input's flavor entities (falling back to the matched catalog row's
+    entities if the input has none), then splits them into meat/seafood/vegetable
+    canonical-name sets using flavor_categories.
+
+    Returns (input_meats, input_seafoods, input_vegs).
+    """
+    input_flavors = set()
+    if extracted_entities and isinstance(extracted_entities, dict):
+        input_flavors.update(x.lower() for x in extracted_entities.get("flavor", set()) if x)
+    if not input_flavors:
+        cat_ents = matched_row.get("entities")
+        if isinstance(cat_ents, dict):
+            input_flavors.update(x.lower() for x in cat_ents.get("flavor", set()) if x)
+    resolved_input_flavors = rules._resolve_flavors(input_flavors) if hasattr(rules, "_resolve_flavors") else input_flavors
+
+    input_meats = {f for f in resolved_input_flavors if flavor_categories.get(f, (False, False, False))[0] and not flavor_categories.get(f, (False, False, False))[2]}
+    input_seafoods = {f for f in resolved_input_flavors if flavor_categories.get(f, (False, False, False))[2]}
+    input_vegs = {f for f in resolved_input_flavors if flavor_categories.get(f, (False, False, False))[1]}
+
+    return input_meats, input_seafoods, input_vegs
 
 def build_food_flavors_info(
     brands_df: pd.DataFrame

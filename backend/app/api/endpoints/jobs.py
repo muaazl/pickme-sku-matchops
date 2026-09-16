@@ -10,7 +10,7 @@ from backend.app.core.db import get_db_connection
 from backend.app.schemas.models import BaseRequest, JobResponse, SKUItem
 from backend.app.api.endpoints.engine_callbacks import _job_eta, _job_progress
 from backend.app.services.engine_client import cancel_engine_job
-from backend.app.services.worker import _jobs, enqueue_job
+from backend.app.services.worker import enqueue_job
 
 router = APIRouter()
 
@@ -67,7 +67,11 @@ def get_jobs(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     page: int = 1,
-    limit: Optional[int] = None,
+    # Generous default backstop against loading the entire table on a very long-lived
+    # install — well above any realistic job count for an admin tool, so it shouldn't
+    # change behavior in practice. Pass limit=0 (as some callers already do for
+    # /processed-skus) to explicitly request every row with no cap.
+    limit: Optional[int] = 10000,
     db: sqlite3.Connection = Depends(get_db_connection)
 ):
     query = "SELECT * FROM jobs WHERE 1=1"
@@ -264,11 +268,9 @@ def get_job(id: str, db: sqlite3.Connection = Depends(get_db_connection)):
 @router.post("/jobs/{id}/cancel")
 def cancel_job(id: str, db: sqlite3.Connection = Depends(get_db_connection)):
     db.execute("UPDATE jobs SET status = 'cancelled', cancel_requested = 1, completed_at = datetime('now') WHERE id = ? AND status IN ('queued', 'running')", (id,))
+    db.execute("UPDATE batches SET status = 'cancelled', completed_at = datetime('now') WHERE id = ?", (id,))
     db.commit()
-    
-    if id in _jobs:
-        _jobs[id] = 'cancelled'
-        
+
     # Notify ML Engine microservice
     cancel_engine_job(id)
     return {"message": "Cancellation completed"}

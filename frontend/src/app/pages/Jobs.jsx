@@ -50,6 +50,12 @@ export default function Jobs() {
   // Confirmation Modal State
   const [confirm, setConfirm] = useState({ open: false, title: '', message: '', onConfirm: null });
 
+  // Reset page when the status filter changes, otherwise a filter with fewer matches can
+  // land on an out-of-range page and show a false "No jobs found."
+  useEffect(() => {
+    setPage(0);
+  }, [filter]);
+
   const {
     data: serverJobs,
     isLoading,

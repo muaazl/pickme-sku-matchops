@@ -7,10 +7,9 @@ from engine.rules_engine.loader import Rule
 
 
 class TestRulesActions(unittest.TestCase):
-    def _create_rule(self, actions: list, rule_id: str = "r1", module: str = "bt_override", description: str = "desc", reasoning: str = "reason") -> Rule:
+    def _create_rule(self, actions: list, rule_id: str = "r1", description: str = "desc", reasoning: str = "reason") -> Rule:
         rule = MagicMock(spec=Rule)
         rule.rule_id = rule_id
-        rule.module = module
         rule.description = description
         rule.reasoning = reasoning
         rule.actions = actions
@@ -138,48 +137,42 @@ class TestRulesEngineOrchestrator(unittest.TestCase):
 
     @patch("engine.rules_engine.engine.get_rules")
     @patch("engine.rules_engine.engine.evaluate_conditions")
-    def test_fixed_module_execution_sequence(self, mock_eval, mock_get_rules):
-        # Setup mock rules for each module
-        modules_called = []
+    def test_rules_run_in_priority_order(self, mock_eval, mock_get_rules):
+        # Rules for a domain now run as a single flat list, ordered by priority
+        # (the loader's get_rules() already sorts them, so the engine just iterates in order).
+        rule_ids_in_order = ["rule_10", "rule_20", "rule_30"]
 
-        def side_effect_get_rules(domain, module):
-            modules_called.append(module)
+        def make_rule(rid):
             r = MagicMock(spec=Rule)
-            r.rule_id = f"rule_{module}"
-            r.module = module
-            r.description = f"Desc for {module}"
-            r.reasoning = f"Reason for {module}"
-            r.actions = [{"action_type": "set_visibility", "value": module}]
-            return [r]
+            r.rule_id = rid
+            r.description = f"Desc for {rid}"
+            r.reasoning = f"Reason for {rid}"
+            r.actions = [{"action_type": "set_visibility", "value": rid}]
+            return r
 
-        mock_get_rules.side_effect = side_effect_get_rules
+        mock_get_rules.return_value = [make_rule(rid) for rid in rule_ids_in_order]
         mock_eval.return_value = True
 
         record = {"domain": "food", "sku_name": "Test SKU"}
         result = run_rules_engine(record)
 
-        # Expected fixed sequence: BT Override -> GK Injection -> Formatter -> Visibility
-        self.assertEqual(modules_called, ["bt_override", "gk_injection", "formatter", "visibility"])
-        self.assertEqual(len(result["rules_applied"]), 4)
-        self.assertEqual([r["module"] for r in result["rules_applied"]], ["bt_override", "gk_injection", "formatter", "visibility"])
+        mock_get_rules.assert_called_once_with(domain="food")
+        self.assertEqual(len(result["rules_applied"]), 3)
+        self.assertEqual([r["rule_id"] for r in result["rules_applied"]], rule_ids_in_order)
 
     @patch("engine.rules_engine.engine.get_rules")
     @patch("engine.rules_engine.engine.evaluate_conditions")
     def test_rules_applied_provenance_and_preservation(self, mock_eval, mock_get_rules):
         r1 = MagicMock(spec=Rule)
         r1.rule_id = "R_BT_01"
-        r1.module = "bt_override"
         r1.description = "Override Cone to Tub"
         r1.reasoning = "Catalog standard"
         r1.actions = [{"action_type": "set_bt", "value": "Tub"}]
 
-        def side_effect(domain, module):
-            return [r1] if module == "bt_override" else []
-
-        mock_get_rules.side_effect = side_effect
+        mock_get_rules.return_value = [r1]
         mock_eval.return_value = True
 
-        existing_audit = [{"rule_id": "PREV_01", "module": "pre", "description": "prior", "change": "none", "reasoning": "test"}]
+        existing_audit = [{"rule_id": "PREV_01", "description": "prior", "change": "none", "reasoning": "test"}]
         record = {"domain": "market", "bt": "Cone", "rules_applied": existing_audit}
 
         result = run_rules_engine(record)

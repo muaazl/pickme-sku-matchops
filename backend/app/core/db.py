@@ -15,12 +15,12 @@ def get_next_job_id(conn_or_path=None) -> str:
     """Gets the next sequential job ID starting from 1."""
     is_conn = False
     if conn_or_path is None:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=60.0)
     elif hasattr(conn_or_path, 'cursor'):
         conn = conn_or_path
         is_conn = True
     else:
-        conn = sqlite3.connect(conn_or_path)
+        conn = sqlite3.connect(conn_or_path, timeout=60.0)
 
     try:
         cursor = conn.cursor()

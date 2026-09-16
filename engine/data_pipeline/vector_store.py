@@ -223,6 +223,42 @@ class VectorStore:
         if self._call_with_retry("collection_exists", self.client.collection_exists, collection_name):
             self._call_with_retry("delete_collection", self.client.delete_collection, collection_name=collection_name)
 
+    def get_existing_hashes(self, domain: str = config.DOMAIN_MARKET) -> Dict[str, str]:
+        """Bulk-fetches {db_uid: row_hash} for every point currently stored in the domain's
+        catalog collection, straight from Qdrant's payloads.
+
+        Used by the catalog sync script to make the *shared* Qdrant instance's actual
+        contents the source of truth for "has this row already been embedded", instead of
+        a local per-checkout hash file that has no way of knowing what a different checkout
+        already pushed to the same Qdrant instance.
+        """
+        collection_name = self._get_collection_name(domain)
+        exists = self._call_with_retry("collection_exists", self.client.collection_exists, collection_name)
+        if not exists:
+            return {}
+
+        result: Dict[str, str] = {}
+        next_offset = None
+        while True:
+            points, next_offset = self._call_with_retry(
+                "scroll",
+                self.client.scroll,
+                collection_name=collection_name,
+                limit=1000,
+                offset=next_offset,
+                with_payload=["db_uid", "row_hash"],
+                with_vectors=False,
+            )
+            for p in points:
+                payload = p.payload or {}
+                uid = payload.get("db_uid")
+                row_hash = payload.get("row_hash")
+                if uid and row_hash:
+                    result[uid] = row_hash
+            if next_offset is None:
+                break
+        return result
+
     def search_from_vectors(
         self,
         dense_vec: np.ndarray,

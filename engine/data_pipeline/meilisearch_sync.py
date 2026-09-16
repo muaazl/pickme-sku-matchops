@@ -7,6 +7,7 @@ import meilisearch
 from meilisearch.errors import MeilisearchApiError
 
 from engine import config
+from engine.data_pipeline.cache_manager import clean_price
 
 logger = logging.getLogger("matchops.meilisearch_sync")
 
@@ -29,21 +30,6 @@ def is_meili_healthy() -> bool:
         logger.debug(f"Meilisearch health check failed: {e}")
         return False
 
-def clean_price(val) -> Optional[float]:
-    """Safely cleans and converts a price value to a float."""
-    if pd.isna(val) or val is None:
-        return None
-    if isinstance(val, (int, float)):
-        return float(val)
-    if isinstance(val, str):
-        val_str = val.strip().replace("$", "").replace(",", "")
-        if not val_str:
-            return None
-        try:
-            return float(val_str)
-        except ValueError:
-            return None
-    return None
 
 def sync_dataframe_to_meili(df: pd.DataFrame, domain: str, chunk_size: int = 5000, clear_existing: bool = True):
     """
@@ -120,9 +106,10 @@ def sync_dataframe_to_meili(df: pd.DataFrame, domain: str, chunk_size: int = 500
                 break
             except Exception as e:
                 if attempt < max_retries:
+                    logger.warning(f"[MEILI] Attempt {attempt}/{max_retries} failed for chunk {i+1}/{num_chunks} in index '{index_name}': {e}. Retrying in {attempt * 2}s...")
                     time.sleep(attempt * 2)
                 else:
-                    logger.error(f"[MEILI] Failed to index chunk {i+1}/{num_chunks} in index '{index_name}': {e}")
+                    logger.error(f"[MEILI] Failed to index chunk {i+1}/{num_chunks} in index '{index_name}' after {max_retries} attempts: {e}")
                     raise e
             
     logger.info(f"[MEILI] Domain '{domain}' synced successfully to Meilisearch index '{index_name}'!")

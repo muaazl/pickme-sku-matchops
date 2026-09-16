@@ -24,7 +24,7 @@ class DataIngestion:
 
     _catalog_mem_cache = {}  # domain -> DataFrame
     _brands_mem_cache = {}   # domain -> DataFrame
-    _load_lock = threading.Lock()
+    _load_lock = threading.RLock()
 
     @staticmethod
     def clear_mem_cache(domain = None):
@@ -102,7 +102,6 @@ class DataIngestion:
             "gk": f"{domain_suffix}_GK",
             "bt": f"{domain_suffix}_BT",
             third_tag_key: f"{domain_suffix}_{third_tag_sheet}",
-            "bt_gk_map": f"Classifier_BT_GK_Map_{domain_suffix}"
         }
 
     @staticmethod
@@ -162,6 +161,29 @@ class DataIngestion:
                 logger.critical(f"[STAGE] ✖ Failed to stage sheet '{sheet_name}': {e}")
                 raise e
                 
+        # Generate BT-GK map CSVs on the fly directly from staged catalog sheets (not in Google Sheets)
+        for d in domains:
+            domain_suffix = "Food" if d == config.DOMAIN_FOOD else "Market"
+            map_name = f"Classifier_BT_GK_Map_{domain_suffix}"
+            cat_name = config.FOOD_CATALOG_SHEET if d == config.DOMAIN_FOOD else config.MARKET_CATALOG_SHEET
+            map_path = DataIngestion._get_staged_path(map_name)
+            cat_path = DataIngestion._get_staged_path(cat_name)
+            
+            if os.path.exists(cat_path):
+                try:
+                    cat_df = pd.read_csv(cat_path, dtype=str)
+                    col_bt = next((c for c in cat_df.columns if c.strip().lower() in ("basictype", "basic type")), None)
+                    col_gk = next((c for c in cat_df.columns if c.strip().lower() in ("generickeywords", "generic keywords")), None)
+                    if col_bt and col_gk:
+                        pairs = cat_df[[col_bt, col_gk]].dropna().drop_duplicates()
+                        grouped = pairs.groupby(col_bt)[col_gk].apply(lambda x: ", ".join([k.strip() for k in x.unique() if str(k).strip()])).reset_index()
+                        grouped.columns = ["basictype", "generic keywords"]
+                        grouped.to_csv(map_path, index=False, encoding="utf-8")
+                        staged_files[map_name] = map_path
+                        logger.info(f"[STAGE] ✓ Built on-the-fly BT→GK map for '{d.upper()}' ({len(grouped)} entries).")
+                except Exception as gen_err:
+                    logger.warning(f"[STAGE] Could not generate on-the-fly BT-GK map for '{d}': {gen_err}")
+
         manifest_path = os.path.join(config.STAGING_DIR, "staging_manifest.json")
         try:
             with open(manifest_path, "w", encoding="utf-8") as f:
@@ -389,9 +411,9 @@ class DataIngestion:
                         chk_cur = chk_conn.cursor()
                         chk_cur.execute("SELECT COALESCE(SUM(catalog_count), 0) FROM classifier_dictionaries WHERE domain = ?", (domain,))
                         dict_count_sum = chk_cur.fetchone()[0]
-                        if dict_count_sum == 0:
-                            DataIngestion.compute_and_store_dictionary_counts(domain, cat_df=cat_df, conn=chk_conn)
                         chk_conn.close()
+                        if dict_count_sum == 0:
+                            DataIngestion.compute_and_store_dictionary_counts(domain, cat_df=cat_df)
                     except Exception as cnt_err:
                         logger.warning(f"[LOAD] [{domain.upper()}] Could not check dictionary counts: {cnt_err}")
 
@@ -508,39 +530,18 @@ class DataIngestion:
             bt_gk_count = cursor.fetchone()[0]
             
             if bt_gk_count == 0:
-                # Try loading from disk cache PKL or sheets
-                pkl_path = os.path.join(config.CACHE_DIR, f"{domain}_bt_gk_cache.pkl")
-                cached_map = {}
-                if os.path.exists(pkl_path):
-                    try:
-                        import joblib
-                        cached_data = joblib.load(pkl_path)
-                        cached_map = cached_data.get("bt_gk_map", {})
-                    except Exception as e:
-                        logger.warning(f"[LOAD] Could not read {pkl_path}: {e}")
-                if cached_map:
-                    inserts = []
-                    for bt, gks in cached_map.items():
-                        gks_list = gks if isinstance(gks, list) else [gks]
-                        gks_str = ", ".join(gks_list)
-                        gk_cnt = len(gks_list)
-                        cat_cnt = bt_c.get(bt.strip().lower(), 0)
-                        inserts.append((domain, bt, gks_str, gk_cnt, cat_cnt))
-                    cursor.executemany(
-                        "INSERT INTO bt_gk_map (domain, basictype, generic_keywords, gk_count, catalog_count) VALUES (?, ?, ?, ?, ?)",
-                        inserts
-                    )
-            else:
-                # Update catalog_count on existing bt_gk_map rows
-                cursor.execute("SELECT id, basictype, generic_keywords FROM bt_gk_map WHERE domain = ?", (domain,))
-                map_rows = cursor.fetchall()
-                map_updates = []
-                for row_id, bt, gks in map_rows:
-                    cat_cnt = bt_c.get(bt.strip().lower(), 0)
-                    gk_cnt = len([k for k in str(gks).split(",") if k.strip()])
-                    map_updates.append((cat_cnt, gk_cnt, row_id))
-                if map_updates:
-                    cursor.executemany("UPDATE bt_gk_map SET catalog_count = ?, gk_count = ? WHERE id = ?", map_updates)
+                DataIngestion.build_bt_gk_map_from_catalog(domain=domain, cat_df=cat_df, conn=conn)
+                
+            # Update catalog_count on existing bt_gk_map rows
+            cursor.execute("SELECT id, basictype, generic_keywords FROM bt_gk_map WHERE domain = ?", (domain,))
+            map_rows = cursor.fetchall()
+            map_updates = []
+            for row_id, bt, gks in map_rows:
+                cat_cnt = bt_c.get(bt.strip().lower(), 0)
+                gk_cnt = len([k for k in str(gks).split(",") if k.strip()])
+                map_updates.append((cat_cnt, gk_cnt, row_id))
+            if map_updates:
+                cursor.executemany("UPDATE bt_gk_map SET catalog_count = ?, gk_count = ? WHERE id = ?", map_updates)
                     
             conn.commit()
             logger.info(f"[LOAD] [{domain.upper()}] Precomputed and stored dictionary counts in SQLite (GK: {len(gk_c)}, BT: {len(bt_c)}, Brands: {len(brand_c)}).")
@@ -910,66 +911,96 @@ class DataIngestion:
         return dicts
 
     @staticmethod
-    def load_bt_gk_map_from_sheets(sheet_id: str, domain: str = config.DOMAIN_MARKET, force_fetch: bool = False) -> Dict[str, List[str]]:
-        """Loads BT-GK map from SQLite DB. If DB is empty, imports from Google Sheets."""
-        import sqlite3
-        conn = ensure_db_initialized()
-        
+    def build_bt_gk_map_from_catalog(domain: str = config.DOMAIN_MARKET, cat_df: Optional[pd.DataFrame] = None, conn: Optional[sqlite3.Connection] = None) -> Dict[str, List[str]]:
+        """
+        Builds the BT→GK map on the fly from catalog data (SQLite catalog_items or DataFrame).
+        Persists the mappings into SQLite bt_gk_map table and returns {basictype: [generic_keywords]}.
+        """
+        close_conn = False
+        if conn is None:
+            conn = ensure_db_initialized()
+            close_conn = True
         try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM bt_gk_map WHERE domain = ?", (domain,))
-            count = cursor.fetchone()[0]
-        except Exception as e:
-            logger.warning(f"[LOAD] bt_gk_map table check failed: {e}")
-            count = 0
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT basictype, generic_keywords FROM catalog_items WHERE domain = ? AND basictype IS NOT NULL AND generic_keywords IS NOT NULL",
+                (domain,)
+            )
+            cat_rows = cur.fetchall()
             
-        if not force_fetch and count > 0:
-            try:
+            from collections import defaultdict
+            grouped = defaultdict(set)
+            
+            if cat_rows:
+                for bt_val, gk_val in cat_rows:
+                    bt_clean = str(bt_val).strip()
+                    if not bt_clean:
+                        continue
+                    for k in str(gk_val).split(","):
+                        k_clean = k.strip()
+                        if k_clean:
+                            grouped[bt_clean].add(k_clean)
+            elif cat_df is not None and not cat_df.empty:
+                col_bt = next((c for c in cat_df.columns if c.strip().lower() in ("basictype", "basic type")), None)
+                col_gk = next((c for c in cat_df.columns if c.strip().lower() in ("generickeywords", "generic keywords", "generic_keywords")), None)
+                if col_bt and col_gk:
+                    for _, row in cat_df.iterrows():
+                        bt_clean = str(row.get(col_bt, "")).strip()
+                        gk_str = str(row.get(col_gk, "")).strip()
+                        if not bt_clean or not gk_str:
+                            continue
+                        for k in gk_str.split(","):
+                            k_clean = k.strip()
+                            if k_clean:
+                                grouped[bt_clean].add(k_clean)
+
+            result = {}
+            inserts = []
+            for bt, gks_set in grouped.items():
+                sorted_gks = sorted(gks_set)
+                gks_str = ", ".join(sorted_gks)
+                result[bt] = sorted_gks
+                inserts.append((domain, bt, gks_str))
+
+            conn.execute("DELETE FROM bt_gk_map WHERE domain = ?", (domain,))
+            if inserts:
+                conn.executemany("INSERT INTO bt_gk_map (domain, basictype, generic_keywords) VALUES (?, ?, ?)", inserts)
+            conn.commit()
+            logger.info(f"[LOAD] [{domain.upper()}] Generated on the fly and imported {len(inserts)} BT→GK map entries into SQLite.")
+            return result
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            logger.error(f"[LOAD] [{domain.upper()}] Failed to build BT→GK map on the fly: {e}")
+            raise e
+        finally:
+            if close_conn and conn:
+                conn.close()
+
+    @staticmethod
+    def load_bt_gk_map_from_sheets(sheet_id: str = None, domain: str = config.DOMAIN_MARKET, force_fetch: bool = False, cat_df: Optional[pd.DataFrame] = None) -> Dict[str, List[str]]:
+        """
+        Loads or generates BT-GK map. BT-GK maps are built on the fly from the catalog
+        since they are not present in external Google Sheets tabs.
+        """
+        conn = ensure_db_initialized()
+        try:
+            if not force_fetch:
+                cursor = conn.cursor()
                 cursor.execute("SELECT basictype, generic_keywords FROM bt_gk_map WHERE domain = ?", (domain,))
                 rows = cursor.fetchall()
-                conn.close()
-                
-                result = {}
-                for bt, gks in rows:
-                    result[bt] = [k.strip() for k in gks.split(",") if k.strip()]
-                return result
-            except Exception as e:
-                logger.error(f"[LOAD] Failed to load BT-GK map from SQLite: {e}")
-                if conn:
-                    conn.close()
+                if rows:
+                    result = {}
+                    for bt, gks in rows:
+                        result[bt] = [k.strip() for k in gks.split(",") if k.strip()]
+                    return result
 
-        # Fetch from Sheets
-        domain_suffix = "Food" if domain == config.DOMAIN_FOOD else "Market"
-        sheet_name = f"Classifier_BT_GK_Map_{domain_suffix}"
-        logger.info(f"[LOAD] Syncing BT→GK map from Google Sheets ({domain})...")
-
-        df = DataIngestion._fetch_sheet_as_csv(sheet_id, sheet_name, dtype=str).fillna("")
-        df.columns = [c.strip().lower() for c in df.columns]
-
-        conn = ensure_db_initialized()
-        try:
-            conn.execute("DELETE FROM bt_gk_map WHERE domain = ?", (domain,))
-            
-            result = {}
-            for _, row in df.iterrows():
-                bt = str(row.get("basictype", "")).strip()
-                gks = str(row.get("generic keywords", "")).strip()
-                if not bt or not gks:
-                    continue
-                result[bt] = [k.strip() for k in gks.split(",") if k.strip()]
-                
-                conn.execute("""
-                    INSERT INTO bt_gk_map (domain, basictype, generic_keywords) VALUES (?, ?, ?)
-                """, (domain, bt, gks))
-                
-            conn.commit()
-            logger.info(f"[LOAD] Imported BT→GK map into SQLite ({domain}).")
+            logger.info(f"[LOAD] [{domain.upper()}] Building BT→GK map on the fly from catalog...")
+            return DataIngestion.build_bt_gk_map_from_catalog(domain=domain, cat_df=cat_df, conn=conn)
         except Exception as e:
-            conn.rollback()
-            logger.error(f"[LOAD] Failed to import BT→GK map: {e}")
+            logger.error(f"[LOAD] Failed to load or build BT-GK map: {e}")
             raise e
         finally:
             conn.close()
-            
-        return result
+
 
