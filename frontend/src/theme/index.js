@@ -198,8 +198,9 @@ const themeOptions = {
     },
     MuiDialog: {
       styleOverrides: {
-        paper: ({ ownerState }) => ({
+        paper: ({ theme, ownerState }) => ({
           borderRadius: ownerState.fullScreen ? 0 : '0.5rem',
+          border: ownerState.fullScreen ? 'none' : `1px solid ${theme.palette.divider}`,
         }),
       },
     },

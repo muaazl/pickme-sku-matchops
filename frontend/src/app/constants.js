@@ -1,7 +1,5 @@
 export const DOMAINS = ['food', 'market'];
 
-export const RULE_MODULES = ['bt_override', 'gk_injection', 'formatter', 'visibility'];
-
 export const CONDITION_TYPES = [
   'sku_contains',
   'bt_is',

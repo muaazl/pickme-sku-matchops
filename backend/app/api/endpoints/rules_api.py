@@ -21,10 +21,9 @@ router = APIRouter()
 @router.get("/rules", response_model=List[dict])
 def get_rules(
     domain: Optional[str] = None,
-    module: Optional[str] = None,
     db: sqlite3.Connection = Depends(get_db_connection)
 ):
-    return rules_service.get_rules_list(db, domain=domain, module=module)
+    return rules_service.get_rules_list(db, domain=domain)
 
 
 @router.post("/rules", response_model=RuleOperationResponse)
@@ -65,7 +64,6 @@ def test_rule_draft(request: RuleDraftTestRequest):
         0,
         rule_dict["rule_id"],
         rule_dict["domain"],
-        rule_dict["module"],
         rule_dict["priority"],
         rule_dict["description"],
         rule_dict["reasoning"],
@@ -151,7 +149,6 @@ def test_rule(
         rule_dict.get("id", 0),
         rule_dict["rule_id"],
         rule_dict["domain"],
-        rule_dict["module"],
         rule_dict["priority"],
         rule_dict["description"],
         rule_dict["reasoning"],

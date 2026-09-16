@@ -33,6 +33,20 @@ _domain_ner_engines: dict[str, NEREngine] = {}
 _vector_store = None
 _loader_lock = threading.RLock()
 
+# Per-domain build locks. The expensive pipeline/classifier build (catalog load + embedding +
+# Qdrant sync + classifier training) must NOT run while holding _loader_lock — that would
+# serialize market/food builds, which run concurrently by design (see _bg_load_models).
+# Instead each domain gets its own lock, so two concurrent callers building the SAME domain
+# serialize (fixing the duplicate-build race) while market and food can still build in parallel.
+_pipeline_build_locks = {
+    config.DOMAIN_MARKET: threading.Lock(),
+    config.DOMAIN_FOOD: threading.Lock(),
+}
+_classifier_build_locks = {
+    config.DOMAIN_MARKET: threading.Lock(),
+    config.DOMAIN_FOOD: threading.Lock(),
+}
+
 _model_statuses = {
     "market": {"pipeline": "idle", "classifier": "idle"},
     "food": {"pipeline": "idle", "classifier": "idle"}
@@ -88,41 +102,50 @@ def get_pipeline(domain: str, check_for_updates: bool = False, force_sync: bool 
         if domain in _pipelines and not force_sync and not check_for_updates:
             _model_statuses[domain]["pipeline"] = "ready"
             return _pipelines[domain]
-        _model_statuses[domain]["pipeline"] = "loading"
 
-    try:
-        logger.info(f"[{domain.upper()}] Building pipeline...")
-        sys.stdout.flush()
-
-        embed_engine, ner_engine_shared = _get_shared_models()
-        cat_df, brands_df = DataIngestion.load_catalog(
-            config.GOOGLE_SHEET_ID, domain=domain
-        )
-
-        ner_engine = NEREngine(brands_df, domain=domain, shared_model=ner_engine_shared.model)
-        logic_gates = LogicGates(embed_engine, brands_df=brands_df)
-        cache_manager = CacheManager(ner_engine, embed_engine)
-
-        classifier = get_classifier(domain, force_reset=force_sync)
-        matcher = SKUMatcher(
-            cat_df, brands_df, ner_engine, embed_engine,
-            cache_manager, logic_gates, domain=domain,
-            classifier=classifier,
-            check_for_updates=check_for_updates,
-            force_sync=force_sync
-        )
-
+    # Serialize concurrent builds of THIS domain only (market/food still build in parallel).
+    with _pipeline_build_locks[domain]:
+        # Re-check: another thread may have just finished building this domain while we
+        # were waiting for the build lock, making our own build redundant.
         with _loader_lock:
-            _pipelines[domain] = matcher
-            _domain_ner_engines[domain] = ner_engine
-            _model_statuses[domain]["pipeline"] = "ready"
-        logger.info(f"[{domain.upper()}] Pipeline ready.")
-        sys.stdout.flush()
-        return matcher
-    except Exception as e:
-        with _loader_lock:
-            _model_statuses[domain]["pipeline"] = f"failed: {str(e)}"
-        raise e
+            if domain in _pipelines and not force_sync and not check_for_updates:
+                _model_statuses[domain]["pipeline"] = "ready"
+                return _pipelines[domain]
+            _model_statuses[domain]["pipeline"] = "loading"
+
+        try:
+            logger.info(f"[{domain.upper()}] Building pipeline...")
+            sys.stdout.flush()
+
+            embed_engine, ner_engine_shared = _get_shared_models()
+            cat_df, brands_df = DataIngestion.load_catalog(
+                config.GOOGLE_SHEET_ID, domain=domain
+            )
+
+            ner_engine = NEREngine(brands_df, domain=domain, shared_model=ner_engine_shared.model)
+            logic_gates = LogicGates(embed_engine, brands_df=brands_df)
+            cache_manager = CacheManager(ner_engine, embed_engine)
+
+            classifier = get_classifier(domain, force_reset=force_sync)
+            matcher = SKUMatcher(
+                cat_df, brands_df, ner_engine, embed_engine,
+                cache_manager, logic_gates, domain=domain,
+                classifier=classifier,
+                check_for_updates=check_for_updates,
+                force_sync=force_sync
+            )
+
+            with _loader_lock:
+                _pipelines[domain] = matcher
+                _domain_ner_engines[domain] = ner_engine
+                _model_statuses[domain]["pipeline"] = "ready"
+            logger.info(f"[{domain.upper()}] Pipeline ready.")
+            sys.stdout.flush()
+            return matcher
+        except Exception as e:
+            with _loader_lock:
+                _model_statuses[domain]["pipeline"] = f"failed: {str(e)}"
+            raise e
 
 def get_classifier(domain: str, force_reset: bool = False) -> ZeroShotClassifier:
     if domain not in (config.DOMAIN_MARKET, config.DOMAIN_FOOD):
@@ -132,8 +155,25 @@ def get_classifier(domain: str, force_reset: bool = False) -> ZeroShotClassifier
         if domain in _classifiers and not force_reset:
             _model_statuses[domain]["classifier"] = "ready"
             return _classifiers[domain]
-        _model_statuses[domain]["classifier"] = "training"
 
+    return _build_classifier(domain, force_reset)
+
+
+def _build_classifier(domain: str, force_reset: bool) -> ZeroShotClassifier:
+    # Serialize concurrent builds of THIS domain only (market/food still build in parallel).
+    with _classifier_build_locks[domain]:
+        # Re-check: another thread may have just finished training this domain's classifier
+        # while we were waiting for the build lock, making our own build redundant.
+        with _loader_lock:
+            if domain in _classifiers and not force_reset:
+                _model_statuses[domain]["classifier"] = "ready"
+                return _classifiers[domain]
+            _model_statuses[domain]["classifier"] = "training"
+
+        return _train_classifier(domain, force_reset)
+
+
+def _train_classifier(domain: str, force_reset: bool) -> ZeroShotClassifier:
     try:
         logger.info(f"[{domain.upper()}] Building classifier...")
         sys.stdout.flush()

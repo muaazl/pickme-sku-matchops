@@ -98,6 +98,15 @@ def _extract_flavors_from_sku_cached(sku_lower: str) -> frozenset:
 
 _FLAVOR_CACHE = {}
 
+def clear_flavor_cache():
+    """Clears the cached food flavor dictionary so the next flavor_contains/flavor_is rule
+    evaluation reloads it from the current brands/flavors catalog. Without this, the cache
+    (loaded once on first use) never picks up a food catalog resync for the life of the
+    engine process. Call this whenever the food catalog/brands data is reloaded."""
+    global _FLAVOR_CACHE
+    _FLAVOR_CACHE = {}
+    _extract_flavors_from_sku_cached.cache_clear()
+
 def _load_flavor_data():
     global _FLAVOR_CACHE
     if _FLAVOR_CACHE:

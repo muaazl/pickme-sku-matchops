@@ -48,6 +48,13 @@ class NEREngine:
         self.combined_pattern = None
         self._build_brand_knowledge(brands_df)
 
+        # Per-instance memoization for _get_dict_entities. A class-level @lru_cache on an
+        # instance method would key on (self, text) and hold a strong reference to self for
+        # the life of the cache entry, pinning every NEREngine instance ever built (e.g. on
+        # every catalog resync) in memory forever instead of letting old ones be garbage
+        # collected. Binding the cache per-instance here means it lives and dies with self.
+        self._get_dict_entities = functools.lru_cache(maxsize=100000)(self._get_dict_entities)
+
     # ─────────────────────────────────────────────────────────────
     # Model Loading
     # ─────────────────────────────────────────────────────────────
@@ -144,7 +151,6 @@ class NEREngine:
     # Layer 1: Flavor / Brand Alias Dictionary
     # ─────────────────────────────────────────────────────────────
 
-    @functools.lru_cache(maxsize=100000)
     def _get_dict_entities(self, text: str) -> Tuple[frozenset[str], frozenset[str]]:
         """Scans text against the alias dictionary using word-boundary regex + fuzzy fallback."""
         text_lower = text.lower()

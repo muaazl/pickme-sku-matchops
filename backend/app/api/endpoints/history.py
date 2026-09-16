@@ -10,6 +10,19 @@ from backend.app.schemas.models import ProcessedSkuResponse
 
 router = APIRouter()
 
+# Prefixes that spreadsheet apps (Excel/Sheets) interpret as the start of a formula.
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@")
+
+
+def _sanitize_csv_cell(value):
+    """Neutralizes CSV/formula injection: a leading =, +, -, or @ makes Excel/Sheets
+    treat the cell as a formula to execute on open. Prefix with a tab to defuse it
+    while keeping the visible value unchanged for a human reading the export."""
+    if isinstance(value, str) and value.startswith(_CSV_FORMULA_PREFIXES):
+        return "\t" + value
+    return value
+
+
 @router.get("/processed-skus", response_model=List[ProcessedSkuResponse])
 def get_history(
     batch_id: Optional[str] = None,
@@ -56,24 +69,27 @@ def export_history(
 ):
     query = "SELECT * FROM processed_skus"
     params = []
-    
+
     if ids:
         id_list = [i.strip() for i in ids.split(',') if i.strip()]
         if id_list:
             placeholders = ','.join('?' for _ in id_list)
             query += f" WHERE id IN ({placeholders})"
             params.extend(id_list)
-        
+    else:
+        # No explicit id filter: cap the export instead of dumping the entire table.
+        query += " ORDER BY created_at DESC LIMIT 50000"
+
     rows = db.execute(query, params).fetchall()
-    
+
     if format == 'csv':
         output = io.StringIO()
         if rows:
             writer = csv.DictWriter(output, fieldnames=dict(rows[0]).keys())
             writer.writeheader()
             for row in rows:
-                writer.writerow(dict(row))
-        
+                writer.writerow({k: _sanitize_csv_cell(v) for k, v in dict(row).items()})
+
         return Response(
             content=output.getvalue(),
             media_type="text/csv",

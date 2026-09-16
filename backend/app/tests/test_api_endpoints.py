@@ -22,7 +22,6 @@ def test_rules_crud_lifecycle():
     rule_payload = {
         "rule_id": "test_rule_api_999",
         "domain": "market",
-        "module": "bt_override",
         "priority": 500,
         "description": "Integration test rule for API suite.",
         "reasoning": "Verify rules endpoint creation and updates.",
@@ -85,8 +84,7 @@ def test_rules_test_draft_endpoint():
         "rule": {
             "rule_id": "draft_test_1",
             "domain": "food",
-            "module": "bt_override",
-            "priority": 100,
+                "priority": 100,
             "description": "Draft rule test",
             "reasoning": "Test without saving",
             "condition_logic": "AND",

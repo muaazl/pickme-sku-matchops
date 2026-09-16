@@ -23,7 +23,6 @@ class TestSecurityHardening(unittest.TestCase):
         valid_payload = {
             "rule_id": "rule_123",
             "domain": "market",
-            "module": "bt_override",
             "priority": 100,
             "description": "A valid rule description.",
             "reasoning": "Reasoning behind this rule.",
@@ -54,22 +53,6 @@ class TestSecurityHardening(unittest.TestCase):
         invalid_payload = {
             "rule_id": "rule_123",
             "domain": "invalid_domain",  # Rejected
-            "module": "bt_override",
-            "priority": 100,
-            "description": "Description",
-            "reasoning": "Reasoning",
-            "conditions": [],
-            "actions": []
-        }
-        with self.assertRaises(ValidationError):
-            RuleModel(**invalid_payload)
-
-    def test_pydantic_rule_validation_invalid_module(self):
-        # Invalid module name should be rejected
-        invalid_payload = {
-            "rule_id": "rule_123",
-            "domain": "market",
-            "module": "invalid_module",  # Rejected
             "priority": 100,
             "description": "Description",
             "reasoning": "Reasoning",
@@ -85,7 +68,6 @@ class TestSecurityHardening(unittest.TestCase):
         invalid_payload = {
             "rule_id": "rule_123",
             "domain": "market",
-            "module": "bt_override",
             "priority": 100,
             "description": long_description,
             "reasoning": "Reasoning",
@@ -100,7 +82,6 @@ class TestSecurityHardening(unittest.TestCase):
         invalid_payload = {
             "rule_id": "rule_123",
             "domain": "market",
-            "module": "bt_override",
             "priority": 100,
             "description": "Description",
             "reasoning": "Reasoning",
@@ -121,7 +102,6 @@ class TestSecurityHardening(unittest.TestCase):
         invalid_payload = {
             "rule_id": "rule_123",
             "domain": "market",
-            "module": "bt_override",
             "priority": 100,
             "description": "Description",
             "reasoning": "Reasoning",

@@ -167,7 +167,6 @@ class RuleActionModel(BaseModel):
 class RuleModel(BaseModel):
     rule_id: str = Field(..., max_length=50, pattern=r"^[a-zA-Z0-9_-]+$")
     domain: Literal["market", "food", "shared"]
-    module: Literal["bt_override", "gk_injection", "formatter", "visibility"]
     priority: int = Field(..., ge=1, le=10000)
     description: str = Field(..., max_length=250)
     reasoning: str = Field(..., max_length=500)
@@ -222,6 +221,9 @@ class ProcessedSkuResponse(BaseModel):
     bt_confidence: Optional[float] = None
     gk_confidence: Optional[float] = None
     region_confidence: Optional[float] = None
+    input_price: Optional[float] = None
+    input_description: Optional[str] = None
+    input_category: Optional[str] = None
     created_at: Optional[str] = None
 
 class ApiRequestResponse(BaseModel):

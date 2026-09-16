@@ -25,7 +25,12 @@ export function fmtDuration(minutes) {
 
 export function fmtTime(str) {
   if (!str) return '—';
-  const d = new Date(str.includes('T') ? str : str.replace(' ', 'T') + 'Z');
+  // Treat a naive timestamp (no explicit timezone offset) as UTC regardless of whether it
+  // uses a space or 'T' as the date/time separator: the backend's timestamps are always UTC,
+  // but a naive 'T'-separated string was previously left unmarked and misparsed as local time.
+  const hasExplicitOffset = /Z$|[+-]\d{2}:?\d{2}$/.test(str);
+  const isoLike = str.includes('T') ? str : str.replace(' ', 'T');
+  const d = new Date(hasExplicitOffset ? isoLike : isoLike + 'Z');
   if (Number.isNaN(d.getTime())) return str;
   return d.toLocaleString('en-US', {
     timeZone: 'Asia/Colombo',

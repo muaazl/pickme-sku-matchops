@@ -3,7 +3,6 @@ import logging
 import os
 import re
 import threading
-from collections import Counter
 from typing import Any, Dict, List, Optional
 
 import joblib
@@ -16,48 +15,13 @@ from engine.data_pipeline.ingestion import DataIngestion
 
 logger = logging.getLogger("matchops.catalog_service")
 
-# In-memory counter cache to avoid re-aggregating dataframe columns repeatedly
-_counters_cache: Dict[tuple, Counter] = {}
-_catalog_records_cache: Dict[tuple, List[Dict[str, Any]]] = {}
-
 _build_lock = threading.Lock()
 _build_in_progress = False
-
-
-def get_column_counter(df: pd.DataFrame, col_name: str, split_comma: bool = True) -> Counter:
-    """Computes and caches frequency counts for values in a DataFrame column."""
-    cache_key = (id(df), col_name, split_comma)
-    if cache_key in _counters_cache:
-        return _counters_cache[cache_key]
-        
-    counter = Counter()
-    if col_name in df.columns:
-        for val_str in df[col_name].dropna():
-            if split_comma:
-                for item in str(val_str).split(","):
-                    counter[item.strip().lower()] += 1
-            else:
-                counter[str(val_str).strip().lower()] += 1
-                
-    _counters_cache[cache_key] = counter
-    return counter
 
 
 def get_catalog_and_brands(domain: str):
     """Load catalog and brands/flavors from local Feather cache if possible, else fetch from sheets."""
     return DataIngestion.load_catalog(engine_config.GOOGLE_SHEET_ID, domain)
-
-
-def get_catalog_records(domain: str, cat_df: Optional[pd.DataFrame] = None) -> List[Dict[str, Any]]:
-    """Returns cached list of catalog row dictionaries for template suggestion and fast lookup."""
-    if cat_df is None:
-        cat_df, _ = get_catalog_and_brands(domain)
-    cache_key = (id(cat_df), domain)
-    if cache_key in _catalog_records_cache:
-        return _catalog_records_cache[cache_key]
-    records = cat_df.to_dict('records')
-    _catalog_records_cache[cache_key] = records
-    return records
 
 
 def get_classifier_dicts(domain: str) -> Dict[str, Any]:
@@ -251,8 +215,6 @@ def _bg_build_cache():
     global _build_in_progress
     logger.info("Background cache build and pre-training started...")
     try:
-        _counters_cache.clear()
-        _catalog_records_cache.clear()
         for domain in ("market", "food"):
             logger.info(f"Rebuilding Feather cache for {domain}...")
             cat_df, _ = DataIngestion.load_catalog(engine_config.GOOGLE_SHEET_ID, domain=domain, force_fetch=True)

@@ -24,9 +24,17 @@ _cancelled_jobs: Set[str] = set()
 _running_jobs: Dict[str, Dict[str, Any]] = {}
 _worker_thread: Optional[threading.Thread] = None
 
-# Persistent HTTP session with connection pooling
+# Persistent HTTP session with connection pooling.
+# allowed_methods must explicitly include POST: urllib3's default excludes it (only
+# idempotent verbs retry out of the box), and every call this session makes is a POST
+# (progress/complete/fail callbacks to the backend, and the Google Sheets webhook).
 _http_session = requests.Session()
-_retries = Retry(total=1, backoff_factor=0.1, status_forcelist=[502, 503, 504])
+_retries = Retry(
+    total=1,
+    backoff_factor=0.1,
+    status_forcelist=[502, 503, 504],
+    allowed_methods=["GET", "POST"],
+)
 _http_session.mount("http://", HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=_retries))
 _http_session.mount("https://", HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=_retries))
 

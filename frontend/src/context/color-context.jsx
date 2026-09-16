@@ -36,7 +36,9 @@ export function ColorModeProvider({ children, initialMode }) {
       const mode = payload?.mode ?? payload?.qdrantTheme ?? payload;
       if (mode === 'light' || mode === 'dark' || mode === 'high-contrast') {
         setColorMode(mode);
-        event.source.postMessage(`{ status: 'success', message: 'Color mode changed to ${mode}' }`, event.origin);
+        if (event.source) {
+          event.source.postMessage(`{ status: 'success', message: 'Color mode changed to ${mode}' }`, event.origin);
+        }
       }
     };
 

@@ -12,7 +12,6 @@ from backend.app.services.catalog_service import (
     get_bt_gk_cache,
     get_catalog_and_brands,
     get_classifier_dicts,
-    get_column_counter,
     get_build_task_callable,
     trigger_build_cache,
 )

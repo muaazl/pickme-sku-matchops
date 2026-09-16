@@ -30,7 +30,8 @@ import RulesAppliedList from '../../components/RulesAppliedList';
 import { JsonBlock } from '../../components/JsonBlock';
 
 function Confidence({ label, value, status, source }) {
-  const num = typeof value === 'number' ? value : 0;
+  const parsed = typeof value === 'number' ? value : Number(value);
+  const num = Number.isFinite(parsed) ? parsed : 0;
   const normalized = num > 1 ? num / 100 : num;
   const pct = Math.round(Math.max(0, Math.min(1, normalized)) * 100);
   return (

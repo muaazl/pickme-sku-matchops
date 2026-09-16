@@ -18,9 +18,16 @@ logger = logging.getLogger("matchops.engine_client")
 ENGINE_URL = os.getenv("ENGINE_URL", "http://localhost:8001").rstrip("/")
 BACKEND_INTERNAL_URL = os.getenv("BACKEND_INTERNAL_URL", "http://localhost:8000").rstrip("/")
 
-# Set up requests session with connection pooling and light retry policy
+# Set up requests session with connection pooling and light retry policy.
+# allowed_methods must explicitly include POST: urllib3's default excludes it (only
+# idempotent verbs retry out of the box), and almost every call in this module is a POST.
 _session = requests.Session()
-_retries = Retry(total=2, backoff_factor=0.2, status_forcelist=[502, 503, 504])
+_retries = Retry(
+    total=2,
+    backoff_factor=0.2,
+    status_forcelist=[502, 503, 504],
+    allowed_methods=["GET", "POST"],
+)
 _session.mount("http://", HTTPAdapter(max_retries=_retries))
 _session.mount("https://", HTTPAdapter(max_retries=_retries))
 
@@ -91,6 +98,18 @@ def reload_engine_models() -> Dict[str, Any]:
             return resp.json()
         return {"status": "error", "detail": resp.text}
     except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def refresh_engine_rules() -> Dict[str, Any]:
+    """Tells the ML Engine to reload its rules-engine cache from SQLite (no model reload)."""
+    try:
+        resp = _session.post(f"{ENGINE_URL}/engine/refresh-rules", timeout=5.0)
+        if resp.status_code == 200:
+            return resp.json()
+        return {"status": "error", "detail": resp.text}
+    except Exception as e:
+        logger.warning(f"Failed to notify ML Engine to refresh rules cache: {e}")
         return {"status": "error", "error": str(e)}
 
 

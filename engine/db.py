@@ -13,7 +13,6 @@ CREATE TABLE IF NOT EXISTS rules (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     rule_id         TEXT UNIQUE NOT NULL,
     domain          TEXT NOT NULL,
-    module          TEXT NOT NULL,
     priority        INTEGER NOT NULL DEFAULT 100,
     description     TEXT NOT NULL,
     reasoning       TEXT NOT NULL,
@@ -100,6 +99,9 @@ CREATE TABLE IF NOT EXISTS processed_skus (
     bt_confidence REAL,
     gk_confidence REAL,
     region_confidence REAL,
+    input_price REAL,
+    input_description TEXT,
+    input_category TEXT,
     created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -176,7 +178,7 @@ CREATE TABLE IF NOT EXISTS bt_gk_map (
 -- 9. Indexes for Performance
 CREATE INDEX IF NOT EXISTS idx_conditions_rule_id ON conditions(rule_id);
 CREATE INDEX IF NOT EXISTS idx_actions_rule_id ON actions(rule_id);
-CREATE INDEX IF NOT EXISTS idx_rules_domain_module ON rules(domain, module, priority);
+CREATE INDEX IF NOT EXISTS idx_rules_domain_priority ON rules(domain, priority);
 CREATE INDEX IF NOT EXISTS idx_jobs_started_at ON jobs(started_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_status_started ON jobs(status, started_at);
 CREATE INDEX IF NOT EXISTS idx_api_requests_created_at ON api_requests(created_at);
@@ -219,10 +221,39 @@ def ensure_db_initialized(conn_or_path=None, force: bool = False) -> sqlite3.Con
                 return conn
 
         conn.executescript(SCHEMA_SQL)
-        
+
         # Apply any column migrations if necessary
         cursor = conn.cursor()
-        
+
+        # rules table: drop legacy 'module' column (the rules-engine module concept was removed;
+        # rules now run as a single flat, priority-ordered list per domain).
+        cursor.execute("PRAGMA table_info(rules);")
+        rules_cols = [row[1] for row in cursor.fetchall()]
+        if "module" in rules_cols:
+            conn.execute("DROP INDEX IF EXISTS idx_rules_domain_module;")
+            conn.execute("""
+                CREATE TABLE rules_new (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    rule_id         TEXT UNIQUE NOT NULL,
+                    domain          TEXT NOT NULL,
+                    priority        INTEGER NOT NULL DEFAULT 100,
+                    description     TEXT NOT NULL,
+                    reasoning       TEXT NOT NULL,
+                    condition_logic TEXT NOT NULL DEFAULT 'AND',
+                    is_active       INTEGER NOT NULL DEFAULT 1,
+                    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+            """)
+            conn.execute("""
+                INSERT INTO rules_new (id, rule_id, domain, priority, description, reasoning, condition_logic, is_active, created_at, updated_at)
+                SELECT id, rule_id, domain, priority, description, reasoning, condition_logic, is_active, created_at, updated_at FROM rules;
+            """)
+            conn.execute("DROP TABLE rules;")
+            conn.execute("ALTER TABLE rules_new RENAME TO rules;")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_rules_domain_priority ON rules(domain, priority);")
+            logger.info("[DB] Migrated 'rules' table: dropped legacy 'module' column.")
+
         # api_requests columns
         cursor.execute("PRAGMA table_info(api_requests);")
         api_cols = [row[1] for row in cursor.fetchall()]
@@ -257,7 +288,10 @@ def ensure_db_initialized(conn_or_path=None, force: bool = False) -> sqlite3.Con
             "match_score": "REAL",
             "bt_confidence": "REAL",
             "gk_confidence": "REAL",
-            "region_confidence": "REAL"
+            "region_confidence": "REAL",
+            "input_price": "REAL",
+            "input_description": "TEXT",
+            "input_category": "TEXT"
         }
         for col_name, col_type in new_cols_skus.items():
             if col_name not in sku_cols:

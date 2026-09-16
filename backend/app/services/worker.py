@@ -16,9 +16,6 @@ from backend.app.api.endpoints.engine_callbacks import _job_progress, _job_eta
 
 logger = logging.getLogger("matchops.backend.worker")
 
-# In-memory status caches for fast endpoint lookups
-_jobs: dict[str, str] = {}
-
 
 def enqueue_job(request: BaseRequest, task: str) -> dict:
     """
@@ -29,44 +26,49 @@ def enqueue_job(request: BaseRequest, task: str) -> dict:
         raise ValueError("'skus' list is empty.")
 
     domain = request.domain or "market"
-
-    # 1. Get sequential job ID
-    try:
-        conn = sqlite3.connect(DB_PATH, timeout=60.0)
-        conn.execute("PRAGMA busy_timeout=60000;")
-        job_id = get_next_job_id(conn)
-        conn.close()
-    except Exception:
-        job_id = "1"
-
-    _jobs[job_id] = "queued"
-    _job_progress[job_id] = 0.0
-    _job_eta[job_id] = max(3, int(len(request.skus) * 0.04))
-
     target_sheet = request.sheet_name or "N/A"
     skus_data = [sku.model_dump() for sku in request.skus]
     input_skus_json = json.dumps(skus_data)
 
-    # 2. Write initial job state to SQLite
-    try:
+    # Allocate a job ID and write the initial job row in the same transaction, retrying on
+    # a rare id collision (two near-simultaneous submissions both computing the same
+    # "next id" before either commits) instead of silently falling back to a hardcoded "1".
+    max_attempts = 5
+    job_id = None
+    for attempt in range(1, max_attempts + 1):
         conn = sqlite3.connect(DB_PATH, timeout=60.0)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA busy_timeout=60000;")
-        conn.execute(
-            """
-            INSERT INTO jobs (
-                id, batch_id, type, status, current_stage,
-                total_items, completed_items, created_by,
-                started_at, domain, sheet_name, target_sheet, input_skus_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?)
-            """,
-            (job_id, job_id, task, 'queued', 'queued', len(request.skus), 0, 'system', domain, request.sheet_name, target_sheet, input_skus_json)
-        )
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.error(f"Failed to insert job {job_id} into DB: {e}")
-        raise RuntimeError(f"Database error registering job: {e}")
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout=60000;")
+            job_id = get_next_job_id(conn)
+            conn.execute(
+                """
+                INSERT INTO jobs (
+                    id, batch_id, type, status, current_stage,
+                    total_items, completed_items, created_by,
+                    started_at, domain, sheet_name, target_sheet, input_skus_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?)
+                """,
+                (job_id, job_id, task, 'queued', 'queued', len(request.skus), 0, 'system', domain, request.sheet_name, target_sheet, input_skus_json)
+            )
+            conn.commit()
+            break
+        except sqlite3.IntegrityError as e:
+            conn.rollback()
+            job_id = None
+            if attempt == max_attempts:
+                logger.error(f"Failed to allocate a unique job id after {max_attempts} attempts: {e}")
+                raise RuntimeError(f"Could not allocate a unique job id after {max_attempts} attempts: {e}")
+            logger.warning(f"Job id collided with an existing row (attempt {attempt}/{max_attempts}); retrying with a new id.")
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Failed to insert job into DB: {e}")
+            raise RuntimeError(f"Database error registering job: {e}")
+        finally:
+            conn.close()
+
+    _job_progress[job_id] = 0.0
+    _job_eta[job_id] = max(3, int(len(request.skus) * 0.04))
 
     logger.info(f"[JOB {job_id}] Queued {len(request.skus)} SKUs (task={task}, domain={domain})")
 
@@ -91,7 +93,4 @@ def enqueue_job(request: BaseRequest, task: str) -> dict:
         raise RuntimeError(f"Failed to dispatch job to ML Engine: {dispatch_err}")
 
     return {"job_id": job_id, "status": "queued", "total_skus": len(request.skus)}
-
-
-from engine.db import log_outbound_request
 

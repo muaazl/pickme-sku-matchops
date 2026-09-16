@@ -24,6 +24,7 @@ def clean_price(val) -> Optional[float]:
         try:
             return float(val_str)
         except ValueError:
+            logger.warning(f"Could not convert price string '{val}' to float.")
             return None
     return None
 
@@ -152,7 +153,7 @@ class CacheManager:
             if not check_for_updates and not force_sync:
                 raise RuntimeError(
                     f"[CATALOG SYNC ERROR] Catalog metadata cache for domain '{domain.upper()}' was not found at '{processed_df_path}'. "
-                    f"Please run 'python -m engine.scripts.sync_catalog --cache' to rebuild disk caches (or 'python -m engine.scripts.sync_catalog' for a full sync), then start the server."
+                    f"Please run 'python -m engine.scripts.sync_catalog --cache sync' to rebuild disk caches (or 'python -m engine.scripts.sync_catalog' for a full sync), then start the server."
                 )
         else:
             try:

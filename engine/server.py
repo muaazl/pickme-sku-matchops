@@ -25,7 +25,7 @@ from engine.resource_loader import (
     get_pipeline,
     reset_statuses,
 )
-from engine.rules_engine import refresh_rules_cache
+from engine.rules_engine import refresh_rules_cache, clear_flavor_cache
 from engine.template_suggest import suggest_tags_from_template
 from engine.worker_runner import cancel_job, enqueue_batch_job
 from qdrant_client import QdrantClient
@@ -128,6 +128,7 @@ def _bg_load_models():
 
     try:
         refresh_rules_cache()
+        clear_flavor_cache()
 
         def _init_domain(d):
             try:
@@ -280,6 +281,21 @@ def reload_models(background_tasks: BackgroundTasks):
     """Forces cache clearing and model reload."""
     reset_statuses()
     return load_models(background_tasks)
+
+
+@app.post("/engine/refresh-rules")
+def refresh_rules():
+    """Reloads the rules-engine cache from SQLite in this process, without touching ML models.
+
+    Called by the backend after any rules CRUD operation so live matching/classification
+    jobs pick up rule changes immediately, instead of only after a full model reload/restart.
+    """
+    try:
+        refresh_rules_cache()
+        return {"status": "success", "message": "Rules cache refreshed."}
+    except Exception as e:
+        logger.error(f"[ENGINE] Failed to refresh rules cache: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # --- Vector Database & Audit Endpoints ---

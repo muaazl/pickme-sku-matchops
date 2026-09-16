@@ -1,3 +1,4 @@
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
@@ -146,15 +147,18 @@ class EmbeddingEngine:
             return {"dense": np.array([]), "sparse": []}
 
         if not hasattr(self, '_str_cache'):
-            self._str_cache = {}
-            
-        if len(self._str_cache) > 500000:
-            self._str_cache.clear()
+            # LRU (not "grow-then-wipe-everything") cache: an OrderedDict evicts the
+            # least-recently-used entries incrementally once over the cap, instead of a
+            # periodic full clear that both re-encodes frequently-used strings (dictionary
+            # tags, common SKU names) all at once and lets memory grow to the cap every time.
+            self._str_cache = OrderedDict()
 
         missing_texts = []
         missing_set = set()
         for text in texts:
-            if text not in self._str_cache and text not in missing_set:
+            if text in self._str_cache:
+                self._str_cache.move_to_end(text)
+            elif text not in missing_set:
                 missing_texts.append(text)
                 missing_set.add(text)
 
@@ -199,10 +203,14 @@ class EmbeddingEngine:
             for i, text in enumerate(missing_texts):
                 self._str_cache[text] = (flat_dense[i], all_sparse[i])
 
+            max_cache_size = 500000
+            while len(self._str_cache) > max_cache_size:
+                self._str_cache.popitem(last=False)
+
         dim = self._str_cache[texts[0]][0].shape[0]
         out_dense = np.empty((len(texts), dim), dtype=np.float32)
         out_sparse = []
-        
+
         for i, text in enumerate(texts):
             d, s = self._str_cache[text]
             out_dense[i] = d

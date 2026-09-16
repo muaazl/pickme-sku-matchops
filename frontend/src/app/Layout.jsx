@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useTheme } from '@mui/material/styles';
 import { Box, Toolbar, CssBaseline, AppBar, Typography, Button, CircularProgress } from '@mui/material';
 import { Outlet, useLocation, Link } from 'react-router-dom';
@@ -7,9 +7,10 @@ import AccessibilityToggle from '../components/Common/AccessibilityToggle';
 import SkuSidebar from './SkuSidebar';
 import { DrawerHeader } from '../components/Sidebar/SidebarStyled';
 import { Logo } from '../components/Logo';
+import { IconModal } from './components/ui';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { getModelsStatus, loadModels } from './api';
-import { Play, CheckCircle } from 'lucide-react';
+import { Play, CheckCircle, BrainCircuit } from 'lucide-react';
 import { useSnackbar } from 'notistack';
 
 function getPageName(pathname) {
@@ -33,6 +34,8 @@ export default function Layout() {
   const { enqueueSnackbar } = useSnackbar();
   const location = useLocation();
   const wasLoadingRef = useRef(false);
+  const hasPromptedRef = useRef(false);
+  const [showLoadPrompt, setShowLoadPrompt] = useState(false);
 
   const { data: statusData, refetch: refetchStatus } = useQuery({
     queryKey: ['models-status'],
@@ -83,6 +86,19 @@ export default function Layout() {
 
   const isLoading = loadMutation.isPending || !!statusData?.loading_in_progress;
   const isLoaded = !!statusData?.loaded && !statusData?.loading_in_progress && !loadMutation.isPending;
+
+  // Models are never auto-loaded on engine startup (deliberately — a load can be heavy and
+  // isn't always wanted immediately). Once we know for sure they aren't loaded/loading,
+  // prompt exactly once per session instead of relying on someone noticing the app-bar
+  // button; dismissing it doesn't ask again this session.
+  useEffect(() => {
+    if (hasPromptedRef.current) return;
+    if (statusData === undefined) return; // status not fetched yet
+    if (!isLoaded && !isLoading) {
+      hasPromptedRef.current = true;
+      setShowLoadPrompt(true);
+    }
+  }, [statusData, isLoaded, isLoading]);
 
   return (
     <Box sx={{ display: 'flex' }}>
@@ -193,6 +209,37 @@ export default function Layout() {
         <DrawerHeader />
         <Outlet />
       </Box>
+
+      <IconModal
+        open={showLoadPrompt}
+        onClose={() => setShowLoadPrompt(false)}
+        icon={BrainCircuit}
+        title="Load ML models?"
+        description={
+          <>
+            The models aren&apos;t loaded yet. Load them now, or dismiss and use the &quot;Load
+            Models&quot; button in the top bar whenever you&apos;re ready.
+          </>
+        }
+        actions={
+          <>
+            <Button color="inherit" variant="outlined" fullWidth onClick={() => setShowLoadPrompt(false)}>
+              Not now
+            </Button>
+            <Button
+              variant="contained"
+              fullWidth
+              startIcon={<Play size={16} />}
+              onClick={() => {
+                setShowLoadPrompt(false);
+                loadMutation.mutate();
+              }}
+            >
+              Load models
+            </Button>
+          </>
+        }
+      />
     </Box>
   );
 }
