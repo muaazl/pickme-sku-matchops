@@ -147,6 +147,13 @@ COL_BT = "basictype"
 AUTO_THRESHOLD = 0.80
 REVIEW_THRESHOLD = 0.50
 
+BT_ZERO_SHOT_CONFIDENCE_THRESHOLD = 0.40
+BT_DEFAULT_CONFIDENCE_THRESHOLD = 0.50
+
+def get_bt_confidence_threshold(source: str) -> float:
+    """Minimum confidence required to apply a predicted basic-type filter, by prediction source."""
+    return BT_ZERO_SHOT_CONFIDENCE_THRESHOLD if source == "zero-shot" else BT_DEFAULT_CONFIDENCE_THRESHOLD
+
 # Cross-encoder returns raw logits (not probabilities).
 # Any positive logit is treated as a relevant match.
 # Tune this here without touching tagger.py.

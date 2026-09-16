@@ -106,9 +106,10 @@ def sync_dataframe_to_meili(df: pd.DataFrame, domain: str, chunk_size: int = 500
                 break
             except Exception as e:
                 if attempt < max_retries:
+                    logger.warning(f"[MEILI] Attempt {attempt}/{max_retries} failed for chunk {i+1}/{num_chunks} in index '{index_name}': {e}. Retrying in {attempt * 2}s...")
                     time.sleep(attempt * 2)
                 else:
-                    logger.error(f"[MEILI] Failed to index chunk {i+1}/{num_chunks} in index '{index_name}': {e}")
+                    logger.error(f"[MEILI] Failed to index chunk {i+1}/{num_chunks} in index '{index_name}' after {max_retries} attempts: {e}")
                     raise e
             
     logger.info(f"[MEILI] Domain '{domain}' synced successfully to Meilisearch index '{index_name}'!")

@@ -180,3 +180,13 @@ class TextPipeline:
         text = re.sub(r"\b\d+\b", "", text)
         cleaned = re.sub(r"\s+", " ", text).strip()
         return f"Product: {cleaned}"
+
+    @staticmethod
+    def build_ner_input(name: str, description: str = "", category: str = "") -> str:
+        """Concatenates name with description/category, skipping empty or null-placeholder values."""
+        full_text = name or ""
+        if description and str(description).lower() not in ("nan", "none", "<na>"):
+            full_text += f" {description}"
+        if category and str(category).lower() not in ("nan", "none", "<na>"):
+            full_text += f" {category}"
+        return full_text

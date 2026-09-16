@@ -9,6 +9,8 @@ from engine import config
 from engine.nlp.text_cleaner import TextPipeline
 from engine.rules_engine import run_rules_engine
 from engine.classification.tagger import tag_all_skus
+from engine.utils.weight_utils import resolve_weight_bypass_candidate
+from engine.utils.flavor_utils import triage_input_flavors
 
 def run_sku_audit(
     sku_name: str,
@@ -69,12 +71,7 @@ def run_sku_audit(
         except Exception:
             pipeline = None
     
-    full_ner_input = sku_name
-    if description and str(description).lower() not in ("nan", "none", "<na>"):
-        full_ner_input += f" {description}"
-    if category and str(category).lower() not in ("nan", "none", "<na>"):
-        full_ner_input += f" {category}"
-        
+    full_ner_input = TextPipeline.build_ner_input(sku_name, description, category)
     ner_text = TextPipeline.prep_for_ner(full_ner_input)
     ner_engine = getattr(pipeline, "ner", None) if pipeline else None
     if ner_engine is None and classifier and hasattr(classifier, "ner_engine") and classifier.ner_engine:
@@ -157,43 +154,12 @@ def run_sku_audit(
             if isinstance(cand_indices, int):
                 cand_indices = [cand_indices]
 
-            selected_idx = cand_indices[0]
-            weight_reason = ""
-
-            if input_w_data[0] is not None:
-                in_val, _, in_type = input_w_data
-                best_match_idx = None
-                min_diff_pct = float("inf")
-
-                for c_idx in cand_indices:
-                    cat_row = pipeline.raw_catalog.iloc[c_idx]
-                    catalog_w_data = cat_row.get("weight_val")
-                    if catalog_w_data is not None and isinstance(catalog_w_data, (tuple, list)) and catalog_w_data[0] is not None:
-                        cat_val, _, cat_type = catalog_w_data
-                        if in_type == cat_type:
-                            max_val = max(in_val, cat_val)
-                            diff_pct = abs(in_val - cat_val) / max_val * 100 if max_val > 0 else 0
-                            if diff_pct < min_diff_pct:
-                                min_diff_pct = diff_pct
-                                best_match_idx = c_idx
-
-                if best_match_idx is not None:
-                    selected_idx = best_match_idx
-                    cat_row = pipeline.raw_catalog.iloc[selected_idx]
-                    catalog_w_data = cat_row.get("weight_val")
-                    cat_val = catalog_w_data[0]
-                    if min_diff_pct < 1.0:
-                        weight_reason = f" | Weight Match ({int(in_val)})"
-                    else:
-                        weight_reason = f" | Weight Mismatch ({int(in_val)} vs {int(cat_val)})"
-                else:
-                    cat_row = pipeline.raw_catalog.iloc[selected_idx]
-                    catalog_w_data = cat_row.get("weight_val")
-                    if catalog_w_data is not None and isinstance(catalog_w_data, (tuple, list)) and catalog_w_data[0] is not None:
-                        weight_reason = f" | Weight Mismatch ({int(in_val)} vs {int(catalog_w_data[0])})"
+            selected_idx, weight_reason = resolve_weight_bypass_candidate(
+                pipeline.raw_catalog, cand_indices, input_w_data
+            )
 
             exact_bypass_row = pipeline.raw_catalog.iloc[selected_idx]
-            exact_bypass_reason = f"Whole-SKU Fuzzy Match (100%){weight_reason}"
+            exact_bypass_reason = f"Fuzzy Match (100%){weight_reason}"
 
     # -------------------------------------------------------------
     # Stage 2: Basic Type Prediction & Candidate Search
@@ -210,7 +176,7 @@ def run_sku_audit(
     if pipeline.classifier:
         try:
             bt_tag, confidence, source = pipeline.classifier.predict_bt(input_vec_dense, price=price)
-            threshold = 0.40 if source == "zero-shot" else 0.50
+            threshold = config.get_bt_confidence_threshold(source)
             applied = (confidence >= threshold)
             if applied:
                 bt_filter = bt_tag
@@ -496,18 +462,9 @@ def run_sku_audit(
     orig_gk = winner_gk
 
     if winner is not None and domain == config.DOMAIN_FOOD and getattr(pipeline, "flavor_categories", None):
-        input_flavors = set()
-        if extracted_entities and isinstance(extracted_entities, dict):
-            input_flavors.update(x.lower() for x in extracted_entities.get("flavor", set()) if x)
-        if not input_flavors:
-            cat_ents = winner.get("entities")
-            if isinstance(cat_ents, dict):
-                input_flavors.update(x.lower() for x in cat_ents.get("flavor", set()) if x)
-        resolved_input_flavors = pipeline.rules._resolve_flavors(input_flavors) if hasattr(pipeline.rules, "_resolve_flavors") else input_flavors
-
-        input_meats = {f for f in resolved_input_flavors if pipeline.flavor_categories.get(f, (False, False, False))[0] and not pipeline.flavor_categories.get(f, (False, False, False))[2]}
-        input_seafoods = {f for f in resolved_input_flavors if pipeline.flavor_categories.get(f, (False, False, False))[2]}
-        input_vegs = {f for f in resolved_input_flavors if pipeline.flavor_categories.get(f, (False, False, False))[1]}
+        input_meats, input_seafoods, input_vegs = triage_input_flavors(
+            pipeline.rules, pipeline.flavor_categories, extracted_entities, winner
+        )
 
         if winner_gk:
             kws = [k.strip() for k in winner_gk.split(",") if k.strip()]
@@ -535,20 +492,6 @@ def run_sku_audit(
                     has_input_veg_term = bool(veg_pat.search(clean_input))
                     if not (has_input_veg_term or input_vegs):
                         continue
-                elif not seafood_pat and any(re.search(r"\b" + re.escape(t) + r"\b", kw_lower) for t in getattr(pipeline, "seafood_terms", [])):
-                    has_input_seafood_term = any(re.search(r"\b" + re.escape(t) + r"\b", clean_input) for t in getattr(pipeline, "seafood_terms", []))
-                    if not (has_input_seafood_term or input_seafoods):
-                        continue
-                elif not mixed_pat and any(re.search(r"\b" + re.escape(t) + r"\b", kw_lower) for t in getattr(pipeline, "mixed_terms", [])):
-                    has_input_mixed_term = any(re.search(r"\b" + re.escape(t) + r"\b", clean_input) for t in getattr(pipeline, "mixed_terms", []))
-                    total_unique_items = len(input_meats) + len(input_seafoods)
-                    is_mixed_by_flavors = (total_unique_items >= 2 and len(input_meats) >= 1)
-                    if not (has_input_mixed_term or is_mixed_by_flavors):
-                        continue
-                elif not veg_pat and any(re.search(r"\b" + re.escape(t) + r"\b", kw_lower) for t in getattr(pipeline, "veg_terms", [])):
-                    has_input_veg_term = any(re.search(r"\b" + re.escape(t) + r"\b", clean_input) for t in getattr(pipeline, "veg_terms", []))
-                    if not (has_input_veg_term or input_vegs):
-                        continue
 
                 # B. Specific flavor terms check
                 keep_kw = True
@@ -569,22 +512,27 @@ def run_sku_audit(
                             if canonical not in input_vegs:
                                 keep_kw = False
                                 break
-                else:
-                    for term, (is_meat, is_veg, is_seafood) in pipeline.flavor_categories.items():
-                        if term in getattr(pipeline, "mixed_terms", set()) or term in getattr(pipeline, "seafood_terms", set()) or term in getattr(pipeline, "veg_terms", set()):
-                            continue
-                        pattern = r"\b" + re.escape(term) + r"\b"
-                        if re.search(pattern, kw_lower):
-                            canonical = pipeline.rules.food_flavors_dict.get(term, term) if hasattr(pipeline.rules, "food_flavors_dict") else term
-                            if is_seafood and canonical not in input_seafoods:
-                                keep_kw = False; break
-                            elif is_meat and canonical not in input_meats:
-                                keep_kw = False; break
-                            elif is_veg and canonical not in input_vegs:
-                                keep_kw = False; break
 
                 if keep_kw:
                     filtered_kws.append(kw)
+            winner_gk = ", ".join(filtered_kws)
+    elif winner is not None:
+        # Fallback/Market Domain logic: filter out all flavors (mirrors matcher.py)
+        flavors = set()
+        if extracted_entities and isinstance(extracted_entities, dict):
+            flavors.update(x.lower() for x in extracted_entities.get("flavor", set()) if x)
+        cat_ents = winner.get("entities")
+        if isinstance(cat_ents, dict):
+            flavors.update(x.lower() for x in cat_ents.get("flavor", set()) if x)
+
+        if flavors and winner_gk:
+            kws = [k.strip() for k in winner_gk.split(",") if k.strip()]
+            filtered_kws = []
+            for kw in kws:
+                kw_lower = kw.lower()
+                if any(f in kw_lower for f in flavors):
+                    continue
+                filtered_kws.append(kw)
             winner_gk = ", ".join(filtered_kws)
 
     def _clean_val(row, key):
@@ -939,7 +887,7 @@ def _audit_classifier_pipeline(audit_data: dict, domain: str, sku_name: str, des
         "confidence": bt_conf,
         "source": bt_source,
         "status": bt_status,
-        "threshold": 0.40 if bt_source == "zero-shot" else 0.50,
+        "threshold": config.get_bt_confidence_threshold(bt_source),
         "flavor_conflict": flavor_conflict,
         "conflict_notes": conflict_notes,
         "top_candidates": bt_candidates

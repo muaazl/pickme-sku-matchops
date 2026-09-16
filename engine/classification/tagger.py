@@ -11,6 +11,7 @@ from engine.config import (
     RERANKER_MARGIN,
     TOP_K_RETRIEVAL as TOP_K_FUSED,
 )
+from engine.nlp.text_cleaner import TextPipeline
 
 # Configuration for hybrid fusion and reranking
 FUSION_METHOD = "rrf"
@@ -415,12 +416,7 @@ def tag_all_skus(sku_names, sku_categories, query_embeddings, vector_store, rera
             name_txt = sku_names[idx_sku] or ""
             desc_txt = sku_descriptions[idx_sku] if idx_sku < len(sku_descriptions) else ""
             cat_txt = sku_categories[idx_sku] if idx_sku < len(sku_categories) else ""
-            txt = name_txt
-            if desc_txt and str(desc_txt).lower() not in ("nan", "none", "<na>"):
-                txt += f" {desc_txt}"
-            if cat_txt and str(cat_txt).lower() not in ("nan", "none", "<na>"):
-                txt += f" {cat_txt}"
-            combined_texts.append(txt)
+            combined_texts.append(TextPipeline.build_ner_input(name_txt, desc_txt, cat_txt))
 
         if classifier.domain == "market":
             ner_results = ner_engine.batch_extract_entities(combined_texts)
