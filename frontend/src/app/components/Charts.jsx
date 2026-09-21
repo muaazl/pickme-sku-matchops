@@ -265,3 +265,94 @@ export function VolumeTrendChart({ data }) {
 }
 
 VolumeTrendChart.propTypes = { data: PropTypes.array.isRequired };
+
+export function BasicTypeBarChart({ data }) {
+  const theme = useTheme();
+  const ref = useChart({
+    type: 'bar',
+    data: {
+      labels: data.map((d) => d.basicType),
+      datasets: [
+        {
+          label: 'SKUs',
+          data: data.map((d) => d.count),
+          backgroundColor: theme.palette.info.main,
+          borderRadius: 4,
+        },
+      ],
+    },
+    options: {
+      indexAxis: 'y',
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => ` ${ctx.raw.toLocaleString()} SKUs`,
+          },
+        },
+      },
+      scales: {
+        x: {
+          grid: { color: theme.palette.divider },
+          ticks: { color: theme.palette.text.secondary },
+          beginAtZero: true,
+        },
+        y: {
+          grid: { display: false },
+          ticks: { color: theme.palette.text.secondary },
+        },
+      },
+    },
+  });
+  return <canvas ref={ref} />;
+}
+
+BasicTypeBarChart.propTypes = { data: PropTypes.array.isRequired };
+
+export function RegionDistributionChart({ data }) {
+  const theme = useTheme();
+  const palette = [
+    theme.palette.primary.main,
+    theme.palette.success.main,
+    theme.palette.secondary.main,
+    theme.palette.info.main,
+    theme.palette.warning.main,
+    theme.palette.error.main,
+  ];
+
+  const ref = useChart({
+    type: 'doughnut',
+    data: {
+      labels: data.map((d) => d.tag),
+      datasets: [
+        {
+          data: data.map((d) => d.count),
+          backgroundColor: data.map((_, i) => palette[i % palette.length]),
+          borderWidth: 2,
+          borderColor: theme.palette.background.paper,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: {
+          position: 'bottom',
+          labels: { color: theme.palette.text.secondary, boxWidth: 10, usePointStyle: true, padding: 16 },
+        },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => ` ${ctx.label}: ${ctx.raw.toLocaleString()} SKUs`,
+          },
+        },
+      },
+      cutout: '65%',
+    },
+  });
+  return <canvas ref={ref} />;
+}
+
+RegionDistributionChart.propTypes = { data: PropTypes.array.isRequired };

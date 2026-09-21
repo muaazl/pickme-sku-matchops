@@ -85,6 +85,7 @@ api.interceptors.response.use(
 export const getJobs = async (params) => (await api.get('/jobs', { params })).data;
 export const getJob = async (id) => (await api.get(`/jobs/${id}`)).data;
 export const getDashboardStats = async (params) => (await api.get('/jobs/dashboard-stats', { params })).data;
+export const getTagStats = async (params) => (await api.get('/jobs/tag-stats', { params })).data;
 export const cancelJob = async (id) => (await api.post(`/jobs/${id}/cancel`)).data;
 export const retryJob = async (id) => (await api.post(`/jobs/${id}/retry`)).data;
 

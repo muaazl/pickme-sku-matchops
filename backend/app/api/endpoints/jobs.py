@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from engine import config as engine_config
 from backend.app.core.db import get_db_connection
 from backend.app.schemas.models import BaseRequest, JobResponse, SKUItem
 from backend.app.api.endpoints.engine_callbacks import _job_eta, _job_progress
@@ -252,6 +253,90 @@ def get_dashboard_stats(
         "matchSourceDistribution": match_sources,
         "domainBreakdown": domain_breakdown,
         "volumeTrend": volume_trend
+    }
+
+
+@router.get("/jobs/tag-stats")
+def get_tag_stats(
+    domain: Optional[str] = "all",
+    timeframe: Optional[str] = "30d",
+    db: sqlite3.Connection = Depends(get_db_connection)
+):
+    """
+    Computes Basic Type / Region-Category / tag-status breakdowns from processed_skus,
+    for the tagging-strategy charts on the Dashboard and Guide pages.
+    """
+    where_clauses = ["1=1"]
+    params = []
+
+    if domain and domain.lower() != "all":
+        where_clauses.append("domain = ?")
+        params.append(domain.lower())
+
+    if timeframe == "24h":
+        where_clauses.append("created_at >= datetime('now', '-24 hours')")
+    elif timeframe == "7d":
+        where_clauses.append("created_at >= datetime('now', '-7 days')")
+    elif timeframe == "30d":
+        where_clauses.append("created_at >= datetime('now', '-30 days')")
+
+    where_str = " AND ".join(where_clauses)
+
+    # 1. Basic Type distribution (top 10)
+    bt_query = f"""
+        SELECT bt, COUNT(*) as count
+        FROM processed_skus
+        WHERE {where_str} AND bt IS NOT NULL AND bt != ''
+        GROUP BY bt
+        ORDER BY count DESC
+        LIMIT 10
+    """
+    bt_rows = db.execute(bt_query, params).fetchall()
+    basic_type_distribution = [{"basicType": r[0], "count": r[1]} for r in bt_rows]
+
+    # 2. Region (food) / Category (market) distribution, top 10
+    tag_query = f"""
+        SELECT COALESCE(NULLIF(region, ''), NULLIF(category, '')) as tag, COUNT(*) as count
+        FROM processed_skus
+        WHERE {where_str}
+        GROUP BY tag
+        HAVING tag IS NOT NULL
+        ORDER BY count DESC
+        LIMIT 10
+    """
+    tag_rows = db.execute(tag_query, params).fetchall()
+    region_distribution = [{"tag": r[0], "count": r[1]} for r in tag_rows]
+
+    # 3. Tag status breakdown (AUTO/REVIEW/LOW), derived from the stored per-tag
+    # confidence columns using the same thresholds the live tagger applies
+    # (engine/classification/tagger.py get_status()), so this can never drift
+    # out of sync with the actual pipeline behavior.
+    auto_t = engine_config.AUTO_THRESHOLD
+    review_t = engine_config.REVIEW_THRESHOLD
+
+    def status_breakdown(column: str) -> dict:
+        q = f"""
+            SELECT
+                SUM(CASE WHEN {column} >= ? THEN 1 ELSE 0 END) as auto_count,
+                SUM(CASE WHEN {column} >= ? AND {column} < ? THEN 1 ELSE 0 END) as review_count,
+                SUM(CASE WHEN {column} < ? THEN 1 ELSE 0 END) as low_count
+            FROM processed_skus
+            WHERE {where_str} AND {column} IS NOT NULL
+        """
+        row = db.execute(q, [auto_t, review_t, auto_t, review_t] + params).fetchone()
+        return {"auto": row[0] or 0, "review": row[1] or 0, "low": row[2] or 0}
+
+    tag_status_breakdown = [
+        {"tagType": "Basic Type", **status_breakdown("bt_confidence")},
+        {"tagType": "Generic Keyword", **status_breakdown("gk_confidence")},
+        {"tagType": "Region / Category", **status_breakdown("region_confidence")},
+    ]
+
+    return {
+        "basicTypeDistribution": basic_type_distribution,
+        "regionDistribution": region_distribution,
+        "tagStatusBreakdown": tag_status_breakdown,
+        "thresholds": {"auto": auto_t, "review": review_t},
     }
 
 
