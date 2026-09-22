@@ -130,12 +130,29 @@ def load_catalog_data(
             price_col = col_map[cand]
             break
 
+    df = df.fillna("")
     clean_df = pd.DataFrame()
     clean_df["basictype"] = df[bt_col].astype(str).str.strip()
     clean_df["Name"] = df[name_col].astype(str).str.strip()
-    clean_df["Description"] = df[desc_col].astype(str).str.strip() if desc_col else ""
-    clean_df["Category"] = df[cat_col].astype(str).str.strip() if cat_col else ""
-    clean_df["Price"] = pd.to_numeric(df[price_col], errors="coerce").fillna(0.0) if price_col else 0.0
+    clean_df["Description"] = (
+        df[desc_col].astype(str).str.strip()
+        if desc_col and desc_col in df.columns
+        else pd.Series([""] * len(df))
+    )
+    clean_df["Category"] = (
+        df[cat_col].astype(str).str.strip()
+        if cat_col and cat_col in df.columns
+        else pd.Series([""] * len(df))
+    )
+    clean_df["Price"] = (
+        pd.to_numeric(df[price_col], errors="coerce").fillna(0.0)
+        if price_col and price_col in df.columns
+        else pd.Series([0.0] * len(df))
+    )
+
+    # Clean string literals representing missing values
+    clean_df["Description"] = clean_df["Description"].replace({"nan": "", "None": ""})
+    clean_df["Category"] = clean_df["Category"].replace({"nan": "", "None": ""})
 
     # Filter invalid rows
     clean_df = clean_df[(clean_df["basictype"] != "") & (clean_df["Name"] != "")]
@@ -162,10 +179,16 @@ def extract_embeddings(
     os.makedirs(cache_dir, exist_ok=True)
     cache_file = os.path.join(cache_dir, f"{domain}_weighted_skus_cache.pkl")
 
-    names = df["Name"].tolist()
-    descs = df["Description"].tolist()
-    cats = df["Category"].tolist()
-    keys = [f"{n.strip()}||{d.strip()}||{c.strip()}" for n, d, c in zip(names, descs, cats)]
+    def _to_clean_str_list(series) -> List[str]:
+        return [
+            str(v).strip() if pd.notna(v) and str(v).lower() not in ("nan", "none") else ""
+            for v in series
+        ]
+
+    names = _to_clean_str_list(df["Name"])
+    descs = _to_clean_str_list(df["Description"])
+    cats = _to_clean_str_list(df["Category"])
+    keys = [f"{n}||{d}||{c}" for n, d, c in zip(names, descs, cats)]
 
     sku_cache = {}
     if not force_embed and os.path.exists(cache_file):
