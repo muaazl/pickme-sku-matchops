@@ -124,10 +124,20 @@ def _load_flavor_data():
             
     if brands_df.empty:
         try:
-            from engine.data_pipeline.ingestion import DataIngestion
-            _, brands_df = DataIngestion.load_catalog(config.GOOGLE_SHEET_ID, "food")
+            from engine.db import ensure_db_initialized
+            conn = ensure_db_initialized()
+            brands_df = pd.read_sql_query(
+                "SELECT name AS 'Flavor Name', aliases AS Aliases, is_weak AS Is_Weak, "
+                "is_meat AS Is_Meat, is_vegetable AS Is_Vegetable, is_seafood AS Is_Seafood "
+                "FROM brand_flavors WHERE domain = 'food'",
+                conn
+            )
+            conn.close()
+            for col in ["Is_Weak", "Is_Meat", "Is_Vegetable", "Is_Seafood"]:
+                if col in brands_df.columns:
+                    brands_df[col] = brands_df[col].astype(bool)
         except Exception as e:
-            logger.warning(f"Failed to load flavor sheet for flavor rules: {e}")
+            logger.warning(f"Failed to load flavor data from SQLite for flavor rules: {e}")
             brands_df = pd.DataFrame()
 
     flavors_dict, meat_flavors, vegetable_flavors, seafood_flavors, _ = build_food_flavors_info(brands_df)
