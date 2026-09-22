@@ -20,12 +20,12 @@ _build_in_progress = False
 
 
 def get_catalog_and_brands(domain: str):
-    """Load catalog and brands/flavors from local Feather cache if possible, else fetch from sheets."""
-    return DataIngestion.load_catalog(engine_config.GOOGLE_SHEET_ID, domain)
+    """Load catalog and brands/flavors from local Feather cache or SQLite database."""
+    return DataIngestion.load_catalog(engine_config.GOOGLE_SHEET_ID, domain, force_fetch=False)
 
 
 def get_classifier_dicts(domain: str) -> Dict[str, Any]:
-    """Load classifier dictionaries (GK, BT, category/region tags) from local cache or Google Sheets."""
+    """Load classifier dictionaries (GK, BT, category/region tags) from local cache or SQLite."""
     dicts_cache = os.path.join(engine_config.CACHE_DIR, f"{domain}_classifier_dicts.json")
     if os.path.exists(dicts_cache):
         try:
@@ -34,8 +34,8 @@ def get_classifier_dicts(domain: str) -> Dict[str, Any]:
         except Exception as e:
             logger.warning(f"Failed to read dict cache for domain {domain}: {e}")
             
-    # Fallback to sheets loading
-    dicts = DataIngestion.load_classifier_dictionaries(engine_config.GOOGLE_SHEET_ID, domain)
+    # Load from SQLite or local cache with force_fetch=False (never downloads from Google Sheets)
+    dicts = DataIngestion.load_classifier_dictionaries(engine_config.GOOGLE_SHEET_ID, domain, force_fetch=False)
     try:
         os.makedirs(engine_config.CACHE_DIR, exist_ok=True)
         with open(dicts_cache, "w", encoding="utf-8") as f:
@@ -46,13 +46,30 @@ def get_classifier_dicts(domain: str) -> Dict[str, Any]:
 
 
 def get_bt_gk_cache(domain: str) -> Dict[str, Any]:
-    """Load the cached BT-GK map and umbrella tags from pkl file."""
+    """Load the cached BT-GK map and umbrella tags from pkl file, or reconstruct from SQLite."""
     cache_path = os.path.join(engine_config.CACHE_DIR, f"{domain}_bt_gk_cache.pkl")
     if os.path.exists(cache_path):
         try:
             return joblib.load(cache_path)
         except Exception as e:
             logger.warning(f"Failed to load BT-GK cache for domain {domain}: {e}")
+
+    # Reconstruct from SQLite bt_gk_map table if pkl cache is missing
+    try:
+        from engine.db import ensure_db_initialized
+        conn = ensure_db_initialized()
+        cur = conn.cursor()
+        cur.execute("SELECT basictype, generic_keywords FROM bt_gk_map WHERE domain = ?", (domain,))
+        rows = cur.fetchall()
+        conn.close()
+        if rows:
+            bt_gk_map = {}
+            for bt, gks in rows:
+                bt_gk_map[bt] = [k.strip() for k in gks.split(",") if k.strip()]
+            return {"bt_gk_map": bt_gk_map, "umbrella": {}, "third_tag_map": {}}
+    except Exception as db_err:
+        logger.warning(f"Failed to load BT-GK map from SQLite for domain {domain}: {db_err}")
+
     return {"bt_gk_map": {}, "umbrella": {}, "third_tag_map": {}}
 
 

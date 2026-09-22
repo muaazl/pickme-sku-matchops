@@ -1,17 +1,16 @@
 import { defineConfig } from 'vite';
-import reactRefresh from '@vitejs/plugin-react';
+import react from '@vitejs/plugin-react';
 import svgrPlugin from 'vite-plugin-svgr';
 import eslintPlugin from 'vite-plugin-eslint';
 
 // https://vitejs.dev/config/
 export default defineConfig({
-  base: './',
-  // This changes the output dir from dist to build
+  base: '/',
   build: {
     outDir: 'dist',
   },
   plugins: [
-    reactRefresh(),
+    react(),
     svgrPlugin({
       svgrOptions: {
         icon: true,
