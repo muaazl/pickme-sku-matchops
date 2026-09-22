@@ -90,6 +90,38 @@ CROSS_ENCODER_ONNX = CROSS_ENCODER_ONNX_INT8 if (USE_INT8_MODELS and os.path.exi
 
 GLINER_ONNX = os.path.join(ONNX_DIR, "gliner", "model.onnx")
 
+# --- BasicType (BT) Classifier Model Toggles & Paths ---
+# Options: "arcface" or "logreg" (default: "arcface")
+FOOD_BT_MODEL = os.getenv("FOOD_BT_MODEL", "arcface").lower()
+MARKET_BT_MODEL = os.getenv("MARKET_BT_MODEL", "arcface").lower()
+
+FOOD_BT_ARCFACE_FP32 = os.path.join(ONNX_DIR, "food_bt_arcface.onnx")
+FOOD_BT_ARCFACE_INT8 = os.path.join(ONNX_DIR, "food_bt_arcface_int8.onnx")
+FOOD_BT_ARCFACE_LABELS = os.path.join(ONNX_DIR, "food_bt_arcface_labels.json")
+
+MARKET_BT_ARCFACE_FP32 = os.path.join(ONNX_DIR, "market_bt_arcface.onnx")
+MARKET_BT_ARCFACE_INT8 = os.path.join(ONNX_DIR, "market_bt_arcface_int8.onnx")
+MARKET_BT_ARCFACE_LABELS = os.path.join(ONNX_DIR, "market_bt_arcface_labels.json")
+
+def get_bt_model(domain: str) -> str:
+    """Returns the configured BasicType model identifier ('arcface' or 'logreg') for a domain."""
+    return FOOD_BT_MODEL if domain == DOMAIN_FOOD else MARKET_BT_MODEL
+
+def get_bt_arcface_onnx_path(domain: str) -> str:
+    """Returns the expected ONNX artifact path for the domain's ArcFace BT model."""
+    int8_path = FOOD_BT_ARCFACE_INT8 if domain == DOMAIN_FOOD else MARKET_BT_ARCFACE_INT8
+    fp32_path = FOOD_BT_ARCFACE_FP32 if domain == DOMAIN_FOOD else MARKET_BT_ARCFACE_FP32
+    if USE_INT8_MODELS and os.path.exists(int8_path):
+        return int8_path
+    if not USE_INT8_MODELS and os.path.exists(fp32_path):
+        return fp32_path
+    # Default to INT8 path for fail-fast check
+    return int8_path if USE_INT8_MODELS else fp32_path
+
+def get_bt_arcface_labels_path(domain: str) -> str:
+    """Returns the path to the label encoder mapping JSON for the domain's ArcFace BT model."""
+    return FOOD_BT_ARCFACE_LABELS if domain == DOMAIN_FOOD else MARKET_BT_ARCFACE_LABELS
+
 # --- NER Configuration ---
 MARKET_NER_LABELS = [
     "brand"

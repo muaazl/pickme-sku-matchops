@@ -275,6 +275,8 @@ def process_request(
                 "bt_confidence": float(res.get("bt_confidence") or 0.0),
                 "bt_status": str(res.get("bt_status") or ""),
                 "bt_source": str(res.get("bt_source") or ""),
+                "model": str(res.get("model") or "logreg"),
+                "bt_model": str(res.get("bt_model") or res.get("model") or "logreg"),
                 "suggested_gk": str(res.get("suggested_gk") or ""),
                 "gk_confidence": float(res.get("gk_confidence") or 0.0),
                 "gk_status": str(res.get("gk_status") or ""),
@@ -453,6 +455,8 @@ def process_request(
                         row["suggested_region"]  = str(clf.get("suggested_region", clf.get("suggested_category", "")))
                         row["region_confidence"] = float(clf.get("region_confidence", clf.get("category_confidence", 0.0)))
                         row["region_status"]     = str(clf.get("region_status", clf.get("category_status", "")))
+                        row["model"]             = str(clf.get("model") or "logreg")
+                        row["bt_model"]          = str(clf.get("bt_model") or clf.get("model") or "logreg")
 
                         prior = str(row.get("logic_notes") or "").strip()
                         clf_note = str(clf.get("reasoning", ""))

@@ -665,6 +665,7 @@ def tag_all_skus(sku_names, sku_categories, query_embeddings, vector_store, rera
     # 10. Assemble Final Output Dicts
     results = []
     domain = classifier.domain
+    active_model = getattr(classifier, "active_bt_model", "logreg")
     tag_key = "suggested_region" if domain == "food" else "suggested_category"
     conf_key = "region_confidence" if domain == "food" else "category_confidence"
     status_key = "region_status" if domain == "food" else "category_status"
@@ -683,6 +684,8 @@ def tag_all_skus(sku_names, sku_categories, query_embeddings, vector_store, rera
             "bt_confidence": round(bt_conf, 3),
             "bt_status": get_status(bt_conf, bool(bt_tag), bt_source),
             "bt_source": bt_source,
+            "bt_model": active_model,
+            "model": active_model,
             tag_key: third_tag_name,
             conf_key: round(third_tag_conf, 3),
             status_key: get_status(third_tag_conf, bool(third_tag_name), third_tag_source),
@@ -691,7 +694,7 @@ def tag_all_skus(sku_names, sku_categories, query_embeddings, vector_store, rera
         gk_str = ", ".join(gk_tags)
         third_label = "Region" if domain == "food" else "Category"
         reasoning = (
-            f"Classifier: BT='{bt_tag}' ({bt_source}, {round(bt_conf, 3)}), "
+            f"Classifier ({active_model}): BT='{bt_tag}' ({bt_source}, {round(bt_conf, 3)}), "
             f"GK='{gk_str}' ({round(gk_conf, 3)}), "
             f"{third_label}='{third_tag_name}' ({third_tag_source}, {round(third_tag_conf, 3)})"
         )

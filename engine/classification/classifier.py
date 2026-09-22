@@ -64,8 +64,80 @@ class ZeroShotClassifier:
             list(self.third_tag_descs.values()), f"{domain}_classifier_third_tag_descs"
         )
 
+        # BasicType (BT) Model Configuration: "arcface" or "logreg"
+        self.bt_model = config.get_bt_model(domain)
+        self._arcface_session = None
+        self._arcface_classes = []
+        self._arcface_price_scaler = None
+        self._arcface_input_name = None
+
+        if self.bt_model == "arcface":
+            self._load_arcface_model()
+
         # Attempt to train sklearn classifiers if labeled data exists
         self._try_train(force_retrain=force_retrain)
+
+    def _load_arcface_model(self):
+        """
+        Loads the INT8 ArcFace ONNX model and label mapping for the domain.
+        Fails fast if the model file or label mapping is missing or corrupt.
+        """
+        import onnxruntime as ort
+
+        onnx_path = config.get_bt_arcface_onnx_path(self.domain)
+        labels_path = config.get_bt_arcface_labels_path(self.domain)
+
+        if not os.path.exists(onnx_path) or not os.path.exists(labels_path):
+            raise RuntimeError(
+                f"[FAIL-FAST] Domain '{self.domain}' is configured with BT_MODEL='arcface', "
+                f"but required ONNX model file '{onnx_path}' or label mapping '{labels_path}' is missing. "
+                f"Please train and export the model using 'python -m engine.scripts.train_bt_head --domain {self.domain}' "
+                f"or configure {self.domain.upper()}_BT_MODEL=logreg in your environment."
+            )
+
+        try:
+            with open(labels_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            self._arcface_classes = meta["classes"]
+            scaler_info = meta.get("price_scaler", {})
+            from sklearn.preprocessing import StandardScaler
+            scaler = StandardScaler()
+            scaler.mean_ = np.array([scaler_info.get("mean", 0.0)], dtype=np.float32)
+            scaler.scale_ = np.array([scaler_info.get("scale", 1.0)], dtype=np.float32)
+            scaler.var_ = np.array([scaler_info.get("var", 1.0)], dtype=np.float32)
+            self._arcface_price_scaler = scaler
+        except Exception as e:
+            raise RuntimeError(
+                f"[FAIL-FAST] Failed to parse ArcFace label metadata from '{labels_path}': {e}"
+            ) from e
+
+        try:
+            sess_opts = ort.SessionOptions()
+            sess_opts.add_session_config_entry("session.use_mmap_for_weights", "1")
+            self._arcface_session = ort.InferenceSession(
+                onnx_path, sess_options=sess_opts, providers=["CPUExecutionProvider"]
+            )
+            self._arcface_input_name = self._arcface_session.get_inputs()[0].name
+            logger.info(
+                f"[ARCFACE] [{self.domain.upper()}] Successfully loaded ArcFace INT8 model "
+                f"from {onnx_path} with {len(self._arcface_classes)} classes."
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"[FAIL-FAST] Failed to initialize ONNX InferenceSession from '{onnx_path}': {e}"
+            ) from e
+
+    def _preprocess_arcface_prices(self, prices_list: list[float]) -> np.ndarray:
+        """Preprocesses prices using the ArcFace model's fitted StandardScaler."""
+        prices = np.array(prices_list, dtype=np.float32).reshape(-1, 1)
+        prices = np.clip(prices, 0.0, None)
+        log_prices = np.log1p(prices)
+        if self._arcface_price_scaler is not None:
+            scaled = self._arcface_price_scaler.transform(log_prices)
+            zero_mask = (prices <= 0.0).flatten()
+            scaled[zero_mask] = 0.0
+            return scaled.astype(np.float32)
+        return np.zeros_like(log_prices, dtype=np.float32)
 
     # ── Internal helpers ──────────────────────────────────────
 
@@ -351,15 +423,34 @@ class ZeroShotClassifier:
 
     # ── Public API ────────────────────────────────────────────
 
+    @property
+    def active_bt_model(self) -> str:
+        """Returns the active BasicType classification model identifier ('arcface' or 'logreg')."""
+        return getattr(self, "bt_model", "logreg")
+
     def predict_bt(self, vec: np.ndarray, price: Optional[float] = None) -> tuple[str, float, str]:
         """
         Returns (bt_label, confidence, source).
         source is one of: 'trained', 'zero-shot'
         """
         vec_2d = vec.reshape(1, -1) if vec.ndim == 1 else vec
+        p_val = float(price) if price is not None else 0.0
 
-        if self._trained:
-            p_val = float(price) if price is not None else 0.0
+        # 1. Deep Metric Learning ArcFace Model Path
+        if self.bt_model == "arcface" and self._arcface_session is not None:
+            scaled_p = self._preprocess_arcface_prices([p_val])
+            vec_with_price = np.hstack([vec_2d, scaled_p]).astype(np.float32)
+            logits = self._arcface_session.run(None, {self._arcface_input_name: vec_with_price})[0]
+            # Softmax to derive normalized probabilities
+            exp_logits = np.exp(logits - np.max(logits, axis=-1, keepdims=True))
+            probas = (exp_logits / np.sum(exp_logits, axis=-1, keepdims=True))[0]
+            best = int(np.argmax(probas))
+            conf = float(probas[best])
+            if conf >= 0.4:
+                return self._arcface_classes[best], conf, "trained"
+
+        # 2. Logistic Regression Model Path
+        elif self.bt_model == "logreg" and self._trained and getattr(self, "_bt_clf", None) is not None:
             scaled_p = self._preprocess_prices([p_val], is_training=False)
             vec_with_price = np.hstack([vec_2d, scaled_p])
             proba = self._bt_clf.predict_proba(vec_with_price)[0]
@@ -368,7 +459,7 @@ class ZeroShotClassifier:
             if conf >= 0.4:
                 return self._bt_enc.classes_[best], conf, "trained"
 
-        # Zero-shot: cosine similarity to BT description embeddings
+        # 3. Zero-shot fallback: cosine similarity to BT description embeddings
         if not self.bt_labels:
             return "", 0.0, "zero-shot"
             
@@ -386,26 +477,42 @@ class ZeroShotClassifier:
         if vecs.shape[0] == 0:
             return []
             
-        results = []
-        if self._trained:
+        results = [None] * len(vecs)
+        zero_shot_indices = []
+
+        # 1. Deep Metric Learning ArcFace Model Path
+        if self.bt_model == "arcface" and self._arcface_session is not None:
+            scaled_p = self._preprocess_arcface_prices(prices)
+            vecs_with_price = np.hstack([vecs, scaled_p]).astype(np.float32)
+            logits = self._arcface_session.run(None, {self._arcface_input_name: vecs_with_price})[0]
+            exp_logits = np.exp(logits - np.max(logits, axis=-1, keepdims=True))
+            probas = exp_logits / np.sum(exp_logits, axis=-1, keepdims=True)
+            bests = np.argmax(probas, axis=1)
+            confs = np.max(probas, axis=1)
+
+            for i in range(len(vecs)):
+                if confs[i] >= 0.4:
+                    results[i] = (self._arcface_classes[bests[i]], float(confs[i]), "trained")
+                else:
+                    zero_shot_indices.append(i)
+
+        # 2. Logistic Regression Model Path
+        elif self.bt_model == "logreg" and self._trained and getattr(self, "_bt_clf", None) is not None:
             scaled_p = self._preprocess_prices(prices, is_training=False)
             vec_with_price = np.hstack([vecs, scaled_p])
             probas = self._bt_clf.predict_proba(vec_with_price)
             bests = np.argmax(probas, axis=1)
             confs = np.max(probas, axis=1)
-            
-            # For each item, decide if trained model is confident enough, else fallback to zero-shot
-            zero_shot_indices = []
+
             for i in range(len(vecs)):
                 if confs[i] >= 0.4:
-                    results.append((self._bt_enc.classes_[bests[i]], float(confs[i]), "trained"))
+                    results[i] = (self._bt_enc.classes_[bests[i]], float(confs[i]), "trained")
                 else:
-                    results.append(None) # Placeholder for zero-shot
                     zero_shot_indices.append(i)
         else:
-            results = [None] * len(vecs)
             zero_shot_indices = list(range(len(vecs)))
 
+        # 3. Zero-shot fallback for unconfident predictions
         if zero_shot_indices:
             if not self.bt_labels:
                 for i in zero_shot_indices:

@@ -184,6 +184,7 @@ def run_sku_audit(
                 "predicted_bt": bt_tag,
                 "confidence": float(confidence),
                 "source": source,
+                "model": getattr(pipeline.classifier, "active_bt_model", "logreg"),
                 "threshold": threshold,
                 "filter_applied": applied
             }
@@ -890,6 +891,7 @@ def _audit_classifier_pipeline(audit_data: dict, domain: str, sku_name: str, des
         "predicted_bt": predicted_bt,
         "confidence": bt_conf,
         "source": bt_source,
+        "model": getattr(classifier, "active_bt_model", "logreg"),
         "status": bt_status,
         "threshold": config.get_bt_confidence_threshold(bt_source),
         "flavor_conflict": flavor_conflict,
