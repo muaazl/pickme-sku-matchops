@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
 import sys
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import joblib
 import numpy as np
@@ -247,6 +247,47 @@ class EmbeddingEngine:
             logits = self.cross_session.run(None, ort_inputs)[0]
             scores.extend(logits.flatten().tolist())
         return np.array(scores, dtype=np.float32)
+
+    @staticmethod
+    def predict_centroids_temperature(
+        vecs: np.ndarray,
+        prototypes: np.ndarray,
+        tau: float = 0.05,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Calculates temperature-scaled class probabilities via batch matrix multiplication.
+        vecs: (N, D) or (D,) normalized query embeddings
+        prototypes: (C, D) normalized centroid prototype vectors
+        tau: temperature scaling factor (default: 0.05)
+
+        Returns:
+            Tuple of (probas (N, C), best_indices (N,), confidences (N,))
+        """
+        vecs_2d = np.atleast_2d(vecs)
+        protos_2d = np.atleast_2d(prototypes)
+
+        if vecs_2d.shape[0] == 0 or protos_2d.shape[0] == 0:
+            return (
+                np.empty((vecs_2d.shape[0], protos_2d.shape[0]), dtype=np.float32),
+                np.empty(vecs_2d.shape[0], dtype=np.int64),
+                np.empty(vecs_2d.shape[0], dtype=np.float32),
+            )
+
+        # Dot product / cosine similarity matrix: (N, C)
+        safe_tau = max(float(tau), 1e-6)
+        logits = (vecs_2d @ protos_2d.T) / safe_tau
+
+        # Numerically stable softmax: subtract max along class dimension
+        logits_max = np.max(logits, axis=-1, keepdims=True)
+        exp_logits = np.exp(logits - logits_max)
+        sum_exp = np.sum(exp_logits, axis=-1, keepdims=True)
+        sum_exp = np.where(sum_exp == 0, 1e-12, sum_exp)
+        probas = (exp_logits / sum_exp).astype(np.float32)
+
+        best_indices = np.argmax(probas, axis=-1)
+        confidences = np.max(probas, axis=-1)
+
+        return probas, best_indices, confidences
 
     def check_semantic_similarity(self, text1: str, text2: str) -> float:
         """Computes cosine similarity between two strings."""

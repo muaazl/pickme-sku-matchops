@@ -187,7 +187,7 @@ class TestArcFaceBT(unittest.TestCase):
         clf._arcface_session = mock_sess
 
         test_vec = np.array([1.0, 0.0], dtype=np.float32)
-        pred, conf, source = clf.predict_bt(test_vec, price=150.0)
+        pred, conf, source, _ = clf.predict_bt(test_vec, price=150.0)
 
         self.assertEqual(pred, "Pizza")
         self.assertGreaterEqual(conf, 0.40)
@@ -197,7 +197,7 @@ class TestArcFaceBT(unittest.TestCase):
         # 2. Low confidence (< 0.40) -> falls back to zero-shot
         # Uniform logits -> confidence 1/3 = 0.333 (< 0.40)
         mock_sess.run.return_value = [np.array([[1.0, 1.0, 1.0]], dtype=np.float32)]
-        pred_zs, conf_zs, source_zs = clf.predict_bt(test_vec, price=150.0)
+        pred_zs, conf_zs, source_zs, _ = clf.predict_bt(test_vec, price=150.0)
 
         self.assertEqual(source_zs, "zero-shot")
         self.assertEqual(pred_zs, "Pizza")  # Matched via cosine similarity in zero-shot
@@ -223,7 +223,7 @@ class TestArcFaceBT(unittest.TestCase):
         clf._arcface_session = None
 
         test_vec = np.zeros(1024, dtype=np.float32)
-        pred, conf, source = clf.predict_bt(test_vec, price=50.0)
+        pred, conf, source, _ = clf.predict_bt(test_vec, price=50.0)
 
         self.assertEqual(pred, "Soap")
         self.assertAlmostEqual(conf, 0.85)
@@ -288,7 +288,7 @@ class TestArcFaceBT(unittest.TestCase):
         clf.bt_to_gk_umbrella = {}
         clf.bt_gk_map = {}
 
-        clf.batch_predict_bt = MagicMock(return_value=[("Pizza", 0.92, "trained")])
+        clf.batch_predict_bt = MagicMock(return_value=[("Pizza", 0.92, "trained", [])])
         clf.batch_predict_third_tag = MagicMock(return_value=[("Italian", 0.88, "trained")])
         clf.batch_predict_gk = MagicMock(return_value=[(["Cheese", "Crust"], 0.85, "trained")])
         clf.get_guaranteed_gk = MagicMock(return_value=[])

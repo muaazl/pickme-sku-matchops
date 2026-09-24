@@ -354,6 +354,88 @@ class VectorStore:
                 
         return results
 
+    def search_catalog_neighbors(
+        self,
+        dense_vec: np.ndarray,
+        domain: str = config.DOMAIN_MARKET,
+        top_k: int = 15,
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieves top_k nearest catalog SKUs by dense vector cosine similarity for Tier 2 Few-Shot matching.
+        """
+        collection_name = self._get_collection_name(domain)
+        self._ensure_collection(collection_name)
+        d_vec = dense_vec.tolist() if hasattr(dense_vec, "tolist") else dense_vec
+        try:
+            results = self._call_with_retry(
+                "query_points (catalog neighbors)",
+                self.client.query_points,
+                collection_name=collection_name,
+                query=d_vec,
+                using="dense",
+                limit=top_k,
+                with_payload=True,
+            )
+            hits = []
+            for hit in results.points:
+                p = hit.payload.copy() if hit.payload else {}
+                p["_qdrant_score_"] = float(hit.score)
+                hits.append(p)
+            return hits
+        except Exception as e:
+            logger.warning(f"[QDRANT] search_catalog_neighbors failed: {e}")
+            return []
+
+    def search_batch_catalog_neighbors(
+        self,
+        dense_vecs: List[np.ndarray],
+        domain: str = config.DOMAIN_MARKET,
+        top_k: int = 15,
+    ) -> List[List[Dict[str, Any]]]:
+        """
+        Batch-retrieves top_k nearest catalog SKUs by dense vector cosine similarity for Tier 2 Few-Shot matching.
+        """
+        n = len(dense_vecs)
+        if n == 0:
+            return []
+
+        collection_name = self._get_collection_name(domain)
+        self._ensure_collection(collection_name)
+
+        requests = []
+        for i in range(n):
+            d_vec = dense_vecs[i].tolist() if hasattr(dense_vecs[i], "tolist") else dense_vecs[i]
+            requests.append(QueryRequest(
+                query=d_vec,
+                using="dense",
+                limit=top_k,
+                with_payload=True,
+            ))
+
+        results = []
+        batch_size = 100
+        try:
+            for i in range(0, len(requests), batch_size):
+                chunk = requests[i : i + batch_size]
+                batch_res = self._call_with_retry(
+                    "query_batch_points (catalog neighbors)",
+                    self.client.query_batch_points,
+                    collection_name=collection_name,
+                    requests=chunk,
+                )
+                for res in batch_res:
+                    chunk_hits = []
+                    for hit in res.points:
+                        p = hit.payload.copy() if hit.payload else {}
+                        p["_qdrant_score_"] = float(hit.score)
+                        chunk_hits.append(p)
+                    results.append(chunk_hits)
+        except Exception as e:
+            logger.warning(f"[QDRANT] search_batch_catalog_neighbors failed: {e}")
+            results.extend([[] for _ in range(n - len(results))])
+
+        return results
+
     # --- Classifier Tag Methods ---
 
     def upsert_tags(

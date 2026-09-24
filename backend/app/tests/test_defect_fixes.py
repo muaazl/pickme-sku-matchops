@@ -134,7 +134,10 @@ class TestDefectFixes:
         assert len(clf_results) == 1
         res = clf_results[0]
         assert "reasoning" in res, "Expected 'reasoning' in tag_all_skus output dict"
-        assert "Classifier: BT=" in res["reasoning"], f"Reasoning should format classifier details, got: {res['reasoning']}"
+        assert (
+            "Classifier: BT=" in res["reasoning"]
+            or ("Classifier (" in res["reasoning"] and "BT=" in res["reasoning"])
+        ), f"Reasoning should format classifier details, got: {res['reasoning']}"
 
         # 2. Pipeline escalation chains reasoning
         sku = {

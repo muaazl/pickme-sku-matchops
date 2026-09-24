@@ -175,7 +175,7 @@ def run_sku_audit(
     bt_prediction = {}
     if pipeline.classifier:
         try:
-            bt_tag, confidence, source = pipeline.classifier.predict_bt(input_vec_dense, price=price)
+            bt_tag, confidence, source, _ = pipeline.classifier.predict_bt(input_vec_dense, price=price)
             threshold = config.get_bt_confidence_threshold(source)
             applied = (confidence >= threshold)
             if applied:

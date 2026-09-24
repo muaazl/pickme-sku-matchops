@@ -109,8 +109,10 @@ def get_bt_model(domain: str) -> str:
 
 def get_bt_arcface_onnx_path(domain: str) -> str:
     """Returns the expected ONNX artifact path for the domain's ArcFace BT model."""
-    int8_path = FOOD_BT_ARCFACE_INT8 if domain == DOMAIN_FOOD else MARKET_BT_ARCFACE_INT8
-    fp32_path = FOOD_BT_ARCFACE_FP32 if domain == DOMAIN_FOOD else MARKET_BT_ARCFACE_FP32
+    int8_name = "food_bt_arcface_int8.onnx" if domain == DOMAIN_FOOD else "market_bt_arcface_int8.onnx"
+    fp32_name = "food_bt_arcface.onnx" if domain == DOMAIN_FOOD else "market_bt_arcface.onnx"
+    int8_path = os.path.join(ONNX_DIR, int8_name)
+    fp32_path = os.path.join(ONNX_DIR, fp32_name)
     if USE_INT8_MODELS and os.path.exists(int8_path):
         return int8_path
     if not USE_INT8_MODELS and os.path.exists(fp32_path):
@@ -120,7 +122,8 @@ def get_bt_arcface_onnx_path(domain: str) -> str:
 
 def get_bt_arcface_labels_path(domain: str) -> str:
     """Returns the path to the label encoder mapping JSON for the domain's ArcFace BT model."""
-    return FOOD_BT_ARCFACE_LABELS if domain == DOMAIN_FOOD else MARKET_BT_ARCFACE_LABELS
+    labels_name = "food_bt_arcface_labels.json" if domain == DOMAIN_FOOD else "market_bt_arcface_labels.json"
+    return os.path.join(ONNX_DIR, labels_name)
 
 # --- NER Configuration ---
 MARKET_NER_LABELS = [
