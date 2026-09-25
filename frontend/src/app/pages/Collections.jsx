@@ -22,7 +22,7 @@ import { Search, Circle, Info } from 'lucide-react';
 import prettyBytes from 'pretty-bytes';
 import { PageContainer, PageHeader, SideDrawer } from '../components/ui';
 import { useQuery, useMutation } from '@tanstack/react-query';
-import { getCollections, getCollection, searchCollection } from '../api';
+import { getCollections, getCollection, searchCollection, runInteractiveAudit } from '../api';
 import { useSnackbar } from 'notistack';
 import {
   StyledTableBody,
@@ -42,6 +42,12 @@ const dictTypeLabels = {
   category: 'Category',
 };
 
+// Collections backed by the SKU matcher's hybrid retrieval + RRF + cross-encoder pipeline.
+const COLLECTION_DOMAINS = {
+  market_catalog: 'market',
+  food_catalog: 'food',
+};
+
 export default function Collections() {
   const { enqueueSnackbar } = useSnackbar();
   const [collection, setCollection] = useState('');
@@ -49,6 +55,8 @@ export default function Collections() {
   const [results, setResults] = useState(null);
   const [detailsDrawer, setDetailsDrawer] = useState(null);
   const [payloadDrawer, setPayloadDrawer] = useState(null);
+
+  const matcherDomain = COLLECTION_DOMAINS[collection] || null;
 
   const { data: collections = [], isLoading } = useQuery({
     queryKey: ['collections'],
@@ -95,6 +103,24 @@ export default function Collections() {
     setResults(null);
   }, [collection]);
 
+  // Converts a matcher audit trace's cross-encoder candidate pool into the same
+  // { id, score, payload } shape the dense-search results table already renders.
+  const auditToResults = (auditData) =>
+    (auditData?.stage3_cross_encoder?.top_candidates || []).map((c, idx) => ({
+      id: c.cand_idx ?? idx,
+      score: c.raw_cross_score,
+      raw_cross_score: c.raw_cross_score,
+      payload: {
+        Name: c.catalog_name,
+        basictype: c.basic_type,
+        gk: c.generic_keywords,
+        region: c.region_category,
+        category: c.region_category,
+        raw_cross_score: c.raw_cross_score,
+        final_cross_score: c.final_cross_score,
+      },
+    }));
+
   const searchMutation = useMutation({
     mutationFn: searchCollection,
     onSuccess: (data) => setResults(data.results),
@@ -103,13 +129,27 @@ export default function Collections() {
     },
   });
 
+  const auditMutation = useMutation({
+    mutationFn: runInteractiveAudit,
+    onSuccess: (data) => setResults(auditToResults(data)),
+    onError: (e) => {
+      enqueueSnackbar(`Matcher pipeline search failed: ${e.message}`, { variant: 'error' });
+    },
+  });
+
   const runSearch = () => {
-    if (query.trim() && collection) {
-      searchMutation.mutate({ name: collection, query: query.trim(), top_k: 10, score_threshold: 0.1 });
-    } else {
+    if (!query.trim() || !collection) {
       setResults([]);
+      return;
+    }
+    if (matcherDomain) {
+      auditMutation.mutate({ sku_name: query.trim(), domain: matcherDomain, task: 'matcher' });
+    } else {
+      searchMutation.mutate({ name: collection, query: query.trim(), top_k: 10, score_threshold: 0.1 });
     }
   };
+
+  const isSearching = searchMutation.isPending || auditMutation.isPending;
 
   return (
     <PageContainer>
@@ -199,7 +239,7 @@ export default function Collections() {
       <Card sx={{ mt: 3 }}>
         <CardHeader title="Vector search" titleTypographyProps={{ variant: 'subtitle1' }} />
         <CardContent>
-          <Box sx={{ display: 'flex', gap: 1.5, flexWrap: 'wrap' }}>
+          <Box sx={{ display: 'flex', gap: 1.5, flexWrap: 'wrap', alignItems: 'center' }}>
             <TextField
               select
               size="small"
@@ -222,12 +262,7 @@ export default function Collections() {
               onKeyDown={(e) => e.key === 'Enter' && runSearch()}
               sx={{ flexGrow: 1, minWidth: 240 }}
             />
-            <Button
-              variant="contained"
-              disabled={searchMutation.isPending}
-              startIcon={<Search size={16} />}
-              onClick={runSearch}
-            >
+            <Button variant="contained" disabled={isSearching} startIcon={<Search size={16} />} onClick={runSearch}>
               Search
             </Button>
           </Box>
@@ -245,7 +280,13 @@ export default function Collections() {
                     <StyledTableHead>
                       <TableRow>
                         <StyledHeaderCell>Name</StyledHeaderCell>
-                        {collection.endsWith('_tags') ? (
+                        {matcherDomain ? (
+                          <>
+                            <StyledHeaderCell>Generic Keywords</StyledHeaderCell>
+                            <StyledHeaderCell>Basic Type</StyledHeaderCell>
+                            <StyledHeaderCell>{matcherDomain === 'food' ? 'Region' : 'Category'}</StyledHeaderCell>
+                          </>
+                        ) : collection.endsWith('_tags') ? (
                           <>
                             <StyledHeaderCell>Dict Type</StyledHeaderCell>
                           </>
@@ -262,7 +303,11 @@ export default function Collections() {
                             <StyledHeaderCell>Basic Type</StyledHeaderCell>
                           </>
                         )}
-                        <StyledHeaderCell>Score</StyledHeaderCell>
+                        {matcherDomain ? (
+                          <StyledHeaderCell>Raw CE Score</StyledHeaderCell>
+                        ) : (
+                          <StyledHeaderCell>Score</StyledHeaderCell>
+                        )}
                         <StyledHeaderCell align="right">Payload</StyledHeaderCell>
                       </TableRow>
                     </StyledTableHead>
@@ -282,7 +327,13 @@ export default function Collections() {
                         return (
                           <StyledTableRow key={r.id}>
                             <TableCell sx={{ fontWeight: 500 }}>{name}</TableCell>
-                            {collection.endsWith('_tags') ? (
+                            {matcherDomain ? (
+                              <>
+                                <TableCell sx={{ color: 'text.secondary', fontSize: '0.825rem' }}>{gk}</TableCell>
+                                <TableCell>{bt}</TableCell>
+                                <TableCell>{matcherDomain === 'food' ? region : category}</TableCell>
+                              </>
+                            ) : collection.endsWith('_tags') ? (
                               <>
                                 <TableCell>{dictTypeDisplay}</TableCell>
                               </>
@@ -299,14 +350,25 @@ export default function Collections() {
                                 <TableCell>{bt}</TableCell>
                               </>
                             )}
-                            <TableCell>
-                              <Chip
-                                size="small"
-                                label={r.score.toFixed(4)}
-                                color={r.score >= 0.8 ? 'success' : r.score >= 0.5 ? 'primary' : 'default'}
-                                variant="outlined"
-                              />
-                            </TableCell>
+                            {matcherDomain ? (
+                              <TableCell>
+                                <Chip
+                                  size="small"
+                                  label={r.raw_cross_score.toFixed(4)}
+                                  color={r.raw_cross_score >= 5 ? 'success' : r.raw_cross_score >= 0 ? 'primary' : 'default'}
+                                  variant="outlined"
+                                />
+                              </TableCell>
+                            ) : (
+                              <TableCell>
+                                <Chip
+                                  size="small"
+                                  label={r.score.toFixed(4)}
+                                  color={r.score >= 0.8 ? 'success' : r.score >= 0.5 ? 'primary' : 'default'}
+                                  variant="outlined"
+                                />
+                              </TableCell>
+                            )}
                             <TableCell align="right">
                               <IconButton
                                 size="small"

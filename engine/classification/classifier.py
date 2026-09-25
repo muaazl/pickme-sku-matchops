@@ -64,8 +64,103 @@ class ZeroShotClassifier:
             list(self.third_tag_descs.values()), f"{domain}_classifier_third_tag_descs"
         )
 
+        # BasicType (BT) Model Configuration: "arcface" or "logreg"
+        self.bt_model = config.get_bt_model(domain)
+        self._arcface_session = None
+        self._arcface_classes = []
+        self._arcface_price_scaler = None
+        self._arcface_input_name = None
+
+        if self.bt_model == "arcface":
+            self._load_arcface_model()
+
         # Attempt to train sklearn classifiers if labeled data exists
         self._try_train(force_retrain=force_retrain)
+
+        # Multi-Tier Cold-Start to Warm-Start Router (Tier 1 Zero-Shot, Tier 2 Few-Shot, Tier 3 Centroids)
+        self.cold_start_router = None
+        try:
+            from engine.data_pipeline.vector_store import VectorStore
+            from engine.classification.cold_start_router import ColdStartRouter
+            vs = None
+            try:
+                vs = VectorStore()
+            except Exception as vs_err:
+                logger.debug(f"[{domain}] VectorStore connection notice for ColdStartRouter: {vs_err}")
+
+            self.cold_start_router = ColdStartRouter(
+                domain=domain,
+                embed_engine=self.model,
+                vector_store=vs,
+                descriptions=descriptions,
+                cat_df=self.cat_df,
+                cache_dir=self.cache_dir,
+            )
+            logger.info(f"[{domain.upper()}] ColdStartRouter initialized successfully as classifier fallback.")
+        except Exception as router_err:
+            logger.warning(f"[{domain.upper()}] ColdStartRouter initialization failed: {router_err}")
+
+    def _load_arcface_model(self):
+        """
+        Loads the INT8 ArcFace ONNX model and label mapping for the domain.
+        Fails fast if the model file or label mapping is missing or corrupt.
+        """
+        import onnxruntime as ort
+
+        onnx_path = config.get_bt_arcface_onnx_path(self.domain)
+        labels_path = config.get_bt_arcface_labels_path(self.domain)
+
+        if not os.path.exists(onnx_path) or not os.path.exists(labels_path):
+            raise RuntimeError(
+                f"[FAIL-FAST] Domain '{self.domain}' is configured with BT_MODEL='arcface', "
+                f"but required ONNX model file '{onnx_path}' or label mapping '{labels_path}' is missing. "
+                f"Please train and export the model using 'python -m engine.scripts.train_bt_head --domain {self.domain}' "
+                f"or configure {self.domain.upper()}_BT_MODEL=logreg in your environment."
+            )
+
+        try:
+            with open(labels_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            self._arcface_classes = meta["classes"]
+            scaler_info = meta.get("price_scaler", {})
+            from sklearn.preprocessing import StandardScaler
+            scaler = StandardScaler()
+            scaler.mean_ = np.array([scaler_info.get("mean", 0.0)], dtype=np.float32)
+            scaler.scale_ = np.array([scaler_info.get("scale", 1.0)], dtype=np.float32)
+            scaler.var_ = np.array([scaler_info.get("var", 1.0)], dtype=np.float32)
+            self._arcface_price_scaler = scaler
+        except Exception as e:
+            raise RuntimeError(
+                f"[FAIL-FAST] Failed to parse ArcFace label metadata from '{labels_path}': {e}"
+            ) from e
+
+        try:
+            sess_opts = ort.SessionOptions()
+            sess_opts.add_session_config_entry("session.use_mmap_for_weights", "1")
+            self._arcface_session = ort.InferenceSession(
+                onnx_path, sess_options=sess_opts, providers=["CPUExecutionProvider"]
+            )
+            self._arcface_input_name = self._arcface_session.get_inputs()[0].name
+            logger.info(
+                f"[ARCFACE] [{self.domain.upper()}] Successfully loaded ArcFace INT8 model "
+                f"from {onnx_path} with {len(self._arcface_classes)} classes."
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"[FAIL-FAST] Failed to initialize ONNX InferenceSession from '{onnx_path}': {e}"
+            ) from e
+
+    def _preprocess_arcface_prices(self, prices_list: list[float]) -> np.ndarray:
+        """Preprocesses prices using the ArcFace model's fitted StandardScaler."""
+        prices = np.array(prices_list, dtype=np.float32).reshape(-1, 1)
+        prices = np.clip(prices, 0.0, None)
+        log_prices = np.log1p(prices)
+        if self._arcface_price_scaler is not None:
+            scaled = self._arcface_price_scaler.transform(log_prices)
+            zero_mask = (prices <= 0.0).flatten()
+            scaled[zero_mask] = 0.0
+            return scaled.astype(np.float32)
+        return np.zeros_like(log_prices, dtype=np.float32)
 
     # ── Internal helpers ──────────────────────────────────────
 
@@ -351,75 +446,185 @@ class ZeroShotClassifier:
 
     # ── Public API ────────────────────────────────────────────
 
-    def predict_bt(self, vec: np.ndarray, price: Optional[float] = None) -> tuple[str, float, str]:
+    @property
+    def active_bt_model(self) -> str:
+        """Returns the active BasicType classification model identifier ('arcface' or 'logreg')."""
+        return getattr(self, "bt_model", "logreg")
+
+    def register_new_tag(self, tag: str, description: str = ""):
+        """Dynamically registers a newly introduced tag (with N_c = 0) into the classifier and router."""
+        clean_tag = tag.strip()
+        if not clean_tag:
+            return
+        if clean_tag not in self.bt_labels:
+            self.bt_labels.append(clean_tag)
+        self.bt_descs[clean_tag] = description or clean_tag
+        if hasattr(self, "cold_start_router") and self.cold_start_router is not None:
+            self.cold_start_router.register_new_tag(clean_tag, description)
+
+    def predict_bt(
+        self,
+        vec: np.ndarray,
+        price: Optional[float] = None,
+        sku_name: str = "",
+        sku_description: str = "",
+    ) -> tuple[str, float, str, list[str]]:
         """
-        Returns (bt_label, confidence, source).
-        source is one of: 'trained', 'zero-shot'
+        Returns (bt_label, confidence, source, propagated_gks).
+        source is one of: 'trained', 'few-shot', 'zero-shot'
         """
         vec_2d = vec.reshape(1, -1) if vec.ndim == 1 else vec
+        p_val = float(price) if price is not None else 0.0
 
-        if self._trained:
-            p_val = float(price) if price is not None else 0.0
+        # Check for dynamic zero-shot classes that may match with high cross-encoder confidence
+        cold_router = getattr(self, "cold_start_router", None)
+        if (
+            cold_router is not None
+            and cold_router.registry.zero_shot_classes
+            and sku_name
+        ):
+            zs_tag, zs_conf, zs_src = cold_router.tier1_zero_shot.predict(
+                sku_name, sku_description, query_dense=vec_2d[0]
+            )
+            if zs_conf >= config.AUTO_THRESHOLD and zs_tag:
+                return zs_tag, zs_conf, zs_src, []
+
+        # 1. Deep Metric Learning ArcFace Model Path
+        if self.bt_model == "arcface" and getattr(self, "_arcface_session", None) is not None:
+            scaled_p = self._preprocess_arcface_prices([p_val])
+            vec_with_price = np.hstack([vec_2d, scaled_p]).astype(np.float32)
+            logits = self._arcface_session.run(None, {self._arcface_input_name: vec_with_price})[0]
+            # Softmax to derive normalized probabilities
+            exp_logits = np.exp(logits - np.max(logits, axis=-1, keepdims=True))
+            probas = (exp_logits / np.sum(exp_logits, axis=-1, keepdims=True))[0]
+            best = int(np.argmax(probas))
+            conf = float(probas[best])
+            if conf >= 0.4:
+                return self._arcface_classes[best], conf, "trained", []
+
+        # 2. Logistic Regression Model Path
+        elif self.bt_model == "logreg" and getattr(self, "_trained", False) and getattr(self, "_bt_clf", None) is not None:
             scaled_p = self._preprocess_prices([p_val], is_training=False)
             vec_with_price = np.hstack([vec_2d, scaled_p])
             proba = self._bt_clf.predict_proba(vec_with_price)[0]
             best  = int(np.argmax(proba))
             conf  = float(proba[best])
             if conf >= 0.4:
-                return self._bt_enc.classes_[best], conf, "trained"
+                return self._bt_enc.classes_[best], conf, "trained", []
 
-        # Zero-shot: cosine similarity to BT description embeddings
-        if not self.bt_labels:
-            return "", 0.0, "zero-shot"
+        # 3. Cold-Start to Warm-Start Multi-Tier Fallback (Tier 1 Zero-Shot, Tier 2 Few-Shot, Tier 3 Centroids)
+        if cold_router is not None:
+            r_tag, r_conf, r_src, r_gks = cold_router.route_single(
+                vec_2d[0], sku_name=sku_name, sku_description=sku_description, price=price
+            )
+            if r_tag and r_conf >= config.BT_ZERO_SHOT_CONFIDENCE_THRESHOLD:
+                return r_tag, r_conf, r_src, r_gks
+
+        # 4. Zero-shot static fallback: cosine similarity to BT description embeddings
+        bt_labels = getattr(self, "bt_labels", [])
+        if not bt_labels or not hasattr(self, "bt_embs_pure") or not hasattr(self, "bt_embs_desc"):
+            return "", 0.0, "zero-shot", []
             
         scores_pure = (vec_2d @ self.bt_embs_pure.T)[0]
         scores_desc = (vec_2d @ self.bt_embs_desc.T)[0]
         scores = np.maximum(scores_pure, scores_desc)
         best   = int(np.argmax(scores))
-        return self.bt_labels[best], float(scores[best]), "zero-shot"
+        return bt_labels[best], float(scores[best]), "zero-shot", []
 
-    def batch_predict_bt(self, vecs: np.ndarray, prices: List[float]) -> List[tuple[str, float, str]]:
+    def batch_predict_bt(
+        self,
+        vecs: np.ndarray,
+        prices: List[float],
+        sku_names: Optional[List[str]] = None,
+        sku_descriptions: Optional[List[str]] = None,
+    ) -> List[tuple[str, float, str, list[str]]]:
         """
         Batch version of predict_bt.
-        Returns a list of (bt_label, confidence, source) tuples.
+        Returns a list of (bt_label, confidence, source, propagated_gks) tuples.
         """
         if vecs.shape[0] == 0:
             return []
             
-        results = []
-        if self._trained:
+        n = len(vecs)
+        results = [None] * n
+
+        if sku_names is None:
+            sku_names = [""] * n
+        if sku_descriptions is None:
+            sku_descriptions = [""] * n
+
+        zero_shot_indices = []
+
+        # 1. Deep Metric Learning ArcFace Model Path
+        if self.bt_model == "arcface" and getattr(self, "_arcface_session", None) is not None:
+            scaled_p = self._preprocess_arcface_prices(prices)
+            vecs_with_price = np.hstack([vecs, scaled_p]).astype(np.float32)
+            logits = self._arcface_session.run(None, {self._arcface_input_name: vecs_with_price})[0]
+            exp_logits = np.exp(logits - np.max(logits, axis=-1, keepdims=True))
+            probas = exp_logits / np.sum(exp_logits, axis=-1, keepdims=True)
+            bests = np.argmax(probas, axis=1)
+            confs = np.max(probas, axis=1)
+
+            for i in range(len(vecs)):
+                if confs[i] >= 0.4:
+                    results[i] = (self._arcface_classes[bests[i]], float(confs[i]), "trained", [])
+                else:
+                    zero_shot_indices.append(i)
+
+        # 2. Logistic Regression Model Path
+        elif self.bt_model == "logreg" and getattr(self, "_trained", False) and getattr(self, "_bt_clf", None) is not None:
             scaled_p = self._preprocess_prices(prices, is_training=False)
             vec_with_price = np.hstack([vecs, scaled_p])
             probas = self._bt_clf.predict_proba(vec_with_price)
             bests = np.argmax(probas, axis=1)
             confs = np.max(probas, axis=1)
-            
-            # For each item, decide if trained model is confident enough, else fallback to zero-shot
-            zero_shot_indices = []
+
             for i in range(len(vecs)):
                 if confs[i] >= 0.4:
-                    results.append((self._bt_enc.classes_[bests[i]], float(confs[i]), "trained"))
+                    results[i] = (self._bt_enc.classes_[bests[i]], float(confs[i]), "trained", [])
                 else:
-                    results.append(None) # Placeholder for zero-shot
                     zero_shot_indices.append(i)
         else:
-            results = [None] * len(vecs)
             zero_shot_indices = list(range(len(vecs)))
 
+        # 3. Cold-Start Multi-Tier Fallback for unconfident or cold classes
+        cold_router = getattr(self, "cold_start_router", None)
         if zero_shot_indices:
-            if not self.bt_labels:
-                for i in zero_shot_indices:
-                    results[i] = ("", 0.0, "zero-shot")
-            else:
+            unresolved_zs = []
+            if cold_router is not None:
                 zs_vecs = vecs[zero_shot_indices]
-                scores_pure = zs_vecs @ self.bt_embs_pure.T
-                scores_desc = zs_vecs @ self.bt_embs_desc.T
-                scores = np.maximum(scores_pure, scores_desc)
-                bests = np.argmax(scores, axis=1)
-                confs = np.max(scores, axis=1)
+                zs_names = [sku_names[i] for i in zero_shot_indices]
+                zs_descs = [sku_descriptions[i] for i in zero_shot_indices]
+                zs_prices = [prices[i] if i < len(prices) else 0.0 for i in zero_shot_indices]
+
+                router_preds = cold_router.route_batch(
+                    zs_vecs, sku_names=zs_names, sku_descriptions=zs_descs, prices=zs_prices
+                )
                 for idx_in_zs, orig_idx in enumerate(zero_shot_indices):
-                    results[orig_idx] = (self.bt_labels[bests[idx_in_zs]], float(confs[idx_in_zs]), "zero-shot")
-                    
+                    r_tag, r_conf, r_src, r_gks = router_preds[idx_in_zs]
+                    if r_tag and r_conf >= config.BT_ZERO_SHOT_CONFIDENCE_THRESHOLD:
+                        results[orig_idx] = (r_tag, float(r_conf), r_src, r_gks)
+                    else:
+                        unresolved_zs.append(orig_idx)
+            else:
+                unresolved_zs = zero_shot_indices
+
+            # 4. Final static description cosine fallback for any still-unresolved predictions
+            if unresolved_zs:
+                bt_labels = getattr(self, "bt_labels", [])
+                if not bt_labels or not hasattr(self, "bt_embs_pure") or not hasattr(self, "bt_embs_desc"):
+                    for i in unresolved_zs:
+                        results[i] = ("", 0.0, "zero-shot", [])
+                else:
+                    fallback_vecs = vecs[unresolved_zs]
+                    scores_pure = fallback_vecs @ self.bt_embs_pure.T
+                    scores_desc = fallback_vecs @ self.bt_embs_desc.T
+                    scores = np.maximum(scores_pure, scores_desc)
+                    bests = np.argmax(scores, axis=1)
+                    confs = np.max(scores, axis=1)
+                    for idx_in_fb, orig_idx in enumerate(unresolved_zs):
+                        results[orig_idx] = (bt_labels[bests[idx_in_fb]], float(confs[idx_in_fb]), "zero-shot", [])
+
         return results
 
     def predict_gk(self, vec: np.ndarray, price: Optional[float] = None) -> tuple[list[str], float, str]:

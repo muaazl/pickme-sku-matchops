@@ -55,6 +55,8 @@ class ClassifyResult(BaseModel):
     region_confidence: float
     region_status: str
     region_source: str
+    model: Optional[str] = None
+    bt_model: Optional[str] = None
     rules_applied: str = ""
     logic_notes: str = ""
 
@@ -78,6 +80,8 @@ class PipelineResult(BaseModel):
     suggested_region: Optional[str] = None
     region_confidence: Optional[float] = None
     region_status: Optional[str] = None
+    model: Optional[str] = None
+    bt_model: Optional[str] = None
     pipeline_source: Optional[str] = None
     escalated: bool = False
 

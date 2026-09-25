@@ -101,10 +101,12 @@ def _resolve_flavors_from_text(text: str, flavors_dict: dict) -> set:
     return result
 
 
-def match_bt(vec_dense, classifier, extracted_flavors=None, known_flavors=None, price=None) -> tuple[str, float, str]:
-    bt_tag, confidence, source = classifier.predict_bt(vec_dense, price=price)
+def match_bt(vec_dense, classifier, extracted_flavors=None, known_flavors=None, price=None, sku_name: str = "", sku_description: str = "") -> tuple[str, float, str, list[str]]:
+    bt_tag, confidence, source, propagated_gks = classifier.predict_bt(
+        vec_dense, price=price, sku_name=sku_name, sku_description=sku_description
+    )
     if confidence < REVIEW_THRESHOLD:
-        return "", confidence, source
+        return "", confidence, source, propagated_gks
 
     # Flavor Conflict: checks for conflicts using the dynamic flavors dict.
     if extracted_flavors and bt_tag:
@@ -115,9 +117,9 @@ def match_bt(vec_dense, classifier, extracted_flavors=None, known_flavors=None, 
             input_flavors.update(_resolve_flavors_from_text(f, classifier.food_flavors_dict))
 
         if bt_flavors and input_flavors and bt_flavors.isdisjoint(input_flavors):
-            return "", 0.0, "conflict"
+            return "", 0.0, "conflict", propagated_gks
 
-    return bt_tag, confidence, source
+    return bt_tag, confidence, source, propagated_gks
 
 
 def match_third_tag(vec_dense, sku_name, description, classifier, predicted_bt="", price=None) -> tuple[str, float, str]:
@@ -445,11 +447,16 @@ def tag_all_skus(sku_names, sku_categories, query_embeddings, vector_store, rera
         dense_vecs = np.array([q["dense"] for q in query_embeddings])
         sparse_vecs = [q["sparse"] for q in query_embeddings]
 
-    # 2. Batch predict BT
-    raw_bt_preds = classifier.batch_predict_bt(dense_vecs, sku_prices)
+    # 2. Batch predict BT (using multi-tier cold-start to warm-start fallback)
+    raw_bt_preds = classifier.batch_predict_bt(
+        dense_vecs, sku_prices, sku_names=sku_names, sku_descriptions=sku_descriptions
+    )
     bt_results = [("", 0.0, "")] * n
+    router_gks = {}
     for i in range(n):
-        bt_tag, confidence, source = raw_bt_preds[i]
+        bt_tag, confidence, source, gks = raw_bt_preds[i]
+        if gks:
+            router_gks[i] = gks
         if confidence < REVIEW_THRESHOLD:
             bt_results[i] = ("", confidence, source)
             continue
@@ -507,6 +514,12 @@ def tag_all_skus(sku_names, sku_categories, query_embeddings, vector_store, rera
         guaranteed = classifier.get_guaranteed_gk(bt)
         if not isinstance(guaranteed, list):
             guaranteed = list(guaranteed)
+        
+        # Propagate Tier 2 ML-kNN Generic Keywords if present from few-shot neighbors
+        if i in router_gks:
+            for extra_gk in router_gks[i]:
+                if extra_gk not in guaranteed:
+                    guaranteed.append(extra_gk)
         
         trained_gk, trained_conf, trained_source = trained_gk_preds[i]
         allowed_gks_for_bt = bt_gk_map.get(bt, [])
@@ -665,6 +678,7 @@ def tag_all_skus(sku_names, sku_categories, query_embeddings, vector_store, rera
     # 10. Assemble Final Output Dicts
     results = []
     domain = classifier.domain
+    active_model = getattr(classifier, "active_bt_model", "logreg")
     tag_key = "suggested_region" if domain == "food" else "suggested_category"
     conf_key = "region_confidence" if domain == "food" else "category_confidence"
     status_key = "region_status" if domain == "food" else "category_status"
@@ -683,6 +697,8 @@ def tag_all_skus(sku_names, sku_categories, query_embeddings, vector_store, rera
             "bt_confidence": round(bt_conf, 3),
             "bt_status": get_status(bt_conf, bool(bt_tag), bt_source),
             "bt_source": bt_source,
+            "bt_model": active_model,
+            "model": active_model,
             tag_key: third_tag_name,
             conf_key: round(third_tag_conf, 3),
             status_key: get_status(third_tag_conf, bool(third_tag_name), third_tag_source),
@@ -691,7 +707,7 @@ def tag_all_skus(sku_names, sku_categories, query_embeddings, vector_store, rera
         gk_str = ", ".join(gk_tags)
         third_label = "Region" if domain == "food" else "Category"
         reasoning = (
-            f"Classifier: BT='{bt_tag}' ({bt_source}, {round(bt_conf, 3)}), "
+            f"Classifier ({active_model}): BT='{bt_tag}' ({bt_source}, {round(bt_conf, 3)}), "
             f"GK='{gk_str}' ({round(gk_conf, 3)}), "
             f"{third_label}='{third_tag_name}' ({third_tag_source}, {round(third_tag_conf, 3)})"
         )

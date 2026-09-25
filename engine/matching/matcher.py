@@ -255,7 +255,7 @@ class SKUMatcher:
             bt_preds = self.classifier.batch_predict_bt(ai_dense_vecs, ai_prices)
             for list_idx, ai_idx in enumerate(ai_indices):
                 if bt_preds[list_idx]:
-                    bt_tag, confidence, source = bt_preds[list_idx]
+                    bt_tag, confidence, source, _ = bt_preds[list_idx]
                     threshold = config.get_bt_confidence_threshold(source)
                     if confidence >= threshold:
                         bt_filters[ai_idx] = bt_tag

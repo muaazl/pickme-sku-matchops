@@ -17,6 +17,7 @@ const SkuResults = lazy(() => import('./app/pages/SkuResults'));
 const RulesEngine = lazy(() => import('./app/pages/RulesEngine'));
 const CatalogSearch = lazy(() => import('./app/pages/CatalogSearch'));
 const Logs = lazy(() => import('./app/pages/Logs'));
+const Guide = lazy(() => import('./app/pages/Guide'));
 
 const routes = () => [
   {
@@ -35,6 +36,7 @@ const routes = () => [
       { path: 'rules', element: <RulesEngine /> },
       { path: 'catalog', element: <CatalogSearch /> },
       { path: 'logs', element: <Logs /> },
+      { path: 'guide', element: <Guide /> },
       { path: '*', element: <Navigate to="/dashboard" replace /> },
     ],
   },

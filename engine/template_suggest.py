@@ -25,8 +25,8 @@ logger = logging.getLogger("matchops.engine.template_suggest")
 _catalog_records_cache: Dict[str, tuple] = {}
 
 def get_catalog_and_brands(domain: str):
-    """Load catalog and brands/flavors from local Feather cache if possible, else fetch from sheets."""
-    return DataIngestion.load_catalog(config.GOOGLE_SHEET_ID, domain)
+    """Load catalog and brands/flavors from local Feather cache or SQLite database."""
+    return DataIngestion.load_catalog(config.GOOGLE_SHEET_ID, domain, force_fetch=False)
 
 def get_catalog_records(domain: str, cat_df: Optional[pd.DataFrame] = None) -> List[Dict[str, Any]]:
     """Returns cached list of catalog row dictionaries for template suggestion and fast lookup."""
@@ -40,8 +40,8 @@ def get_catalog_records(domain: str, cat_df: Optional[pd.DataFrame] = None) -> L
     return records
 
 def get_classifier_dicts(domain: str) -> Dict[str, Any]:
-    """Load classifier dictionaries (GK, BT, category/region tags)."""
-    return DataIngestion.load_classifier_dictionaries(config.GOOGLE_SHEET_ID, domain)
+    """Load classifier dictionaries (GK, BT, category/region tags) from local cache or SQLite."""
+    return DataIngestion.load_classifier_dictionaries(config.GOOGLE_SHEET_ID, domain, force_fetch=False)
 
 
 def title_case_with_exceptions(text: str) -> str:

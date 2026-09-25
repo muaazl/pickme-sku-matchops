@@ -119,7 +119,7 @@ def get_pipeline(domain: str, check_for_updates: bool = False, force_sync: bool 
 
             embed_engine, ner_engine_shared = _get_shared_models()
             cat_df, brands_df = DataIngestion.load_catalog(
-                config.GOOGLE_SHEET_ID, domain=domain
+                config.GOOGLE_SHEET_ID, domain=domain, force_fetch=False
             )
 
             ner_engine = NEREngine(brands_df, domain=domain, shared_model=ner_engine_shared.model)
@@ -180,11 +180,11 @@ def _train_classifier(domain: str, force_reset: bool) -> ZeroShotClassifier:
 
         embed_engine, ner_engine_shared = _get_shared_models()
         vector_store = _get_vector_store()
-        cat_df, brands_df = DataIngestion.load_catalog(config.GOOGLE_SHEET_ID, domain=domain)
+        cat_df, brands_df = DataIngestion.load_catalog(config.GOOGLE_SHEET_ID, domain=domain, force_fetch=False)
         
         ner_engine = NEREngine(brands_df, domain=domain, shared_model=ner_engine_shared.model)
         cache_manager = CacheManager(ner_engine, embed_engine)
-        dicts = DataIngestion.load_classifier_dictionaries(config.GOOGLE_SHEET_ID, domain=domain)
+        dicts = DataIngestion.load_classifier_dictionaries(config.GOOGLE_SHEET_ID, domain=domain, force_fetch=False)
 
         def _build_bt_gk(df):
             bt_map = augment_bt_gk_map_with_training(df, {}, dicts.get("gk", []))
@@ -250,7 +250,7 @@ def get_ner_engine(domain: str) -> NEREngine:
     # Build domain NEREngine reusing shared ONNX model
     _, ner_engine_shared = _get_shared_models()
     try:
-        _, brands_df = DataIngestion.load_catalog(config.GOOGLE_SHEET_ID, domain=domain)
+        _, brands_df = DataIngestion.load_catalog(config.GOOGLE_SHEET_ID, domain=domain, force_fetch=False)
     except Exception as e:
         logger.warning(f"Could not load catalog for domain '{domain}' NER: {e}")
         brands_df = pd.DataFrame(columns=["Flavor Name", "Brand Name", "Aliases", "Is_Weak"])

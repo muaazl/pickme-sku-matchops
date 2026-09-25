@@ -289,7 +289,7 @@ class DataIngestion:
 
     @staticmethod
     def load_catalog(sheet_id: str, domain: str = config.DOMAIN_MARKET, force_fetch: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Loads catalog and brands data from memory cache, local SQLite database if present, else downloads from Sheets."""
+        """Loads catalog and brands data from memory cache, local Feather cache, or SQLite database. Only downloads from Sheets when force_fetch=True."""
         # 1. Return from in-memory cache if available and not force_fetch
         if not force_fetch and domain in DataIngestion._catalog_mem_cache and domain in DataIngestion._brands_mem_cache:
             return DataIngestion._catalog_mem_cache[domain], DataIngestion._brands_mem_cache[domain]
@@ -299,6 +299,23 @@ class DataIngestion:
             if not force_fetch and domain in DataIngestion._catalog_mem_cache and domain in DataIngestion._brands_mem_cache:
                 return DataIngestion._catalog_mem_cache[domain], DataIngestion._brands_mem_cache[domain]
 
+            # 2. Check local Feather cache for fast zero-copy memory mapping
+            if not force_fetch:
+                cat_feather = os.path.join(config.CACHE_DIR, f"{domain}_catalog_mmap.feather")
+                brands_feather = os.path.join(config.CACHE_DIR, f"{domain}_brands_mmap.feather")
+                if os.path.exists(cat_feather) and os.path.exists(brands_feather):
+                    try:
+                        cat_df = pd.read_feather(cat_feather)
+                        brands_df = pd.read_feather(brands_feather)
+                        if not cat_df.empty and not brands_df.empty:
+                            logger.info(f"[LOAD] [{domain.upper()}] Loaded {len(cat_df)} catalog items and {len(brands_df)} brands from local Feather cache.")
+                            DataIngestion._catalog_mem_cache[domain] = cat_df
+                            DataIngestion._brands_mem_cache[domain] = brands_df
+                            return cat_df, brands_df
+                    except Exception as fe_err:
+                        logger.warning(f"[LOAD] [{domain.upper()}] Failed to read Feather cache: {fe_err}. Falling back to SQLite.")
+
+            # 3. Check local SQLite database
             import sqlite3
             conn = ensure_db_initialized()
             
@@ -309,7 +326,7 @@ class DataIngestion:
                 cursor.execute("SELECT COUNT(*) FROM brand_flavors WHERE domain = ?", (domain,))
                 brand_count = cursor.fetchone()[0]
             except Exception as e:
-                logger.warning(f"[LOAD] [{domain.upper()}] SQLite check failed: {e}. Falling back to sheet fetch.")
+                logger.warning(f"[LOAD] [{domain.upper()}] SQLite check failed: {e}.")
                 cat_count = 0
                 brand_count = 0
                 
@@ -419,9 +436,16 @@ class DataIngestion:
 
                     return cat_df, brands_df
                 except Exception as e:
-                    logger.error(f"[LOAD] [{domain.upper()}] Failed to query SQL tables: {e}. Falling back to fetch...")
+                    logger.error(f"[LOAD] [{domain.upper()}] Failed to query SQL tables: {e}.")
                     if conn:
                         conn.close()
+
+            # If force_fetch is False, do NOT reach out to Google Sheets over network
+            if not force_fetch:
+                raise RuntimeError(
+                    f"[LOAD] No catalog data found in memory, Feather cache, or SQLite for domain '{domain}'. "
+                    f"Please run 'python -m engine.scripts.sync_catalog' to initialize the catalog."
+                )
 
             return DataIngestion.load_catalog_from_sheets(sheet_id, domain)
 
@@ -841,7 +865,7 @@ class DataIngestion:
 
     @staticmethod
     def load_classifier_dictionaries(sheet_id: str, domain: str = config.DOMAIN_MARKET, force_fetch: bool = False) -> Dict[str, List[str]]:
-        """Loads tag dictionaries from SQLite DB. If DB is empty, imports from Google Sheets."""
+        """Loads tag dictionaries from SQLite DB or local JSON cache. If DB is empty and force_fetch=True, imports from Google Sheets."""
         import sqlite3
         conn = ensure_db_initialized()
         
@@ -872,7 +896,24 @@ class DataIngestion:
                 if conn:
                     conn.close()
 
-        # Fetch from Sheets
+        # Check local JSON cache before raising error if not force_fetch
+        if not force_fetch:
+            if conn:
+                conn.close()
+            dicts_cache = os.path.join(config.CACHE_DIR, f"{domain}_classifier_dicts.json")
+            if os.path.exists(dicts_cache):
+                try:
+                    with open(dicts_cache, "r", encoding="utf-8") as f:
+                        return json.load(f)
+                except Exception as e:
+                    logger.warning(f"[LOAD] Failed to read JSON dict cache: {e}")
+
+            raise RuntimeError(
+                f"[LOAD] No classifier dictionaries found in SQLite or local cache for domain '{domain}'. "
+                f"Please run 'python -m engine.scripts.sync_catalog' to initialize dictionaries."
+            )
+
+        # Fetch from Sheets (only executed when force_fetch=True)
         logger.info(f"[LOAD] Syncing classifier dictionaries from Google Sheets ({domain})...")
         dicts = {}
         third_tag_key = config.get_third_tag_col(domain)

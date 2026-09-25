@@ -175,7 +175,7 @@ def run_sku_audit(
     bt_prediction = {}
     if pipeline.classifier:
         try:
-            bt_tag, confidence, source = pipeline.classifier.predict_bt(input_vec_dense, price=price)
+            bt_tag, confidence, source, _ = pipeline.classifier.predict_bt(input_vec_dense, price=price)
             threshold = config.get_bt_confidence_threshold(source)
             applied = (confidence >= threshold)
             if applied:
@@ -184,6 +184,7 @@ def run_sku_audit(
                 "predicted_bt": bt_tag,
                 "confidence": float(confidence),
                 "source": source,
+                "model": getattr(pipeline.classifier, "active_bt_model", "logreg"),
                 "threshold": threshold,
                 "filter_applied": applied
             }
@@ -291,6 +292,8 @@ def run_sku_audit(
             "catalog_name": str(exact_bypass_row["Name"]),
             "brand": str(exact_bypass_row.get("Brand", exact_bypass_row.get("brand", ""))),
             "basic_type": str(exact_bypass_row.get("basictype", exact_bypass_row.get("BasicType", ""))),
+            "generic_keywords": str(exact_bypass_row.get("Generic keywords", exact_bypass_row.get("GenericKeywords", ""))),
+            "region_category": str(exact_bypass_row.get("region") or exact_bypass_row.get("category") or ""),
             "raw_cross_score": 100.0,
             "token_penalty": 0.0,
             "brand_boost": 0.0,
@@ -306,6 +309,8 @@ def run_sku_audit(
             "catalog_name": str(row["Name"]),
             "brand": str(row.get("Brand", row.get("brand", ""))),
             "basic_type": str(row.get("basictype", row.get("BasicType", ""))),
+            "generic_keywords": str(row.get("Generic keywords", row.get("GenericKeywords", ""))),
+            "region_category": str(row.get("region") or row.get("category") or ""),
             "raw_cross_score": float(row["raw_cross_score"]),
             "token_penalty": float(row["token_penalty"]),
             "brand_boost": float(row["brand_boost"]),
@@ -886,6 +891,7 @@ def _audit_classifier_pipeline(audit_data: dict, domain: str, sku_name: str, des
         "predicted_bt": predicted_bt,
         "confidence": bt_conf,
         "source": bt_source,
+        "model": getattr(classifier, "active_bt_model", "logreg"),
         "status": bt_status,
         "threshold": config.get_bt_confidence_threshold(bt_source),
         "flavor_conflict": flavor_conflict,
